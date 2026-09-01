@@ -1,0 +1,7758 @@
+//! Apps Script relay client.
+//!
+//! Opens a TLS connection to the configured Google IP while the TLS SNI is set
+//! to `front_domain` (e.g. "www.google.com"). Inside the encrypted stream, HTTP
+//! `Host` points to `script.google.com`, and we POST a JSON payload to
+//! `/macros/s/{script_id}/exec`. Apps Script performs the actual upstream
+//! HTTP fetch server-side and returns a JSON envelope.
+//!
+//! Multiplexes over HTTP/2 when the relay edge agrees via ALPN; falls back
+//! to HTTP/1.1 keep-alive when h2 is refused or fails. Range-parallel
+//! downloads are implemented by `relay_parallel_range_to` (writer-based,
+//! streams files larger than Apps Script's single-GET ceiling) with a
+//! buffered `relay_parallel_range` compatibility wrapper for callers that
+//! want a `Vec<u8>` back.
+
+use std::collections::HashMap;
+// AtomicU64 via portable-atomic: native on 64-bit / armv7, spinlock-
+// backed on mipsel (MIPS32 has no 64-bit atomic instructions). API
+// is identical to std::sync::atomic::AtomicU64 so call sites need
+// no other changes.
+use portable_atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use bytes::Bytes;
+use rand::{thread_rng, Rng, RngCore};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{broadcast, Mutex};
+use tokio::time::timeout;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+
+use crate::cache::{cache_key, is_cacheable_method, parse_ttl, ResponseCache};
+use crate::config::Config;
+use crate::quota_tracker::{QuotaSummary, QuotaTracker};
+
+#[derive(Debug, thiserror::Error)]
+pub enum FronterError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("tls: {0}")]
+    Tls(#[from] rustls::Error),
+    #[error("invalid dns name: {0}")]
+    Dns(#[from] rustls::pki_types::InvalidDnsNameError),
+    #[error("bad response: {0}")]
+    BadResponse(String),
+    #[error("relay error: {0}")]
+    Relay(String),
+    #[error("timeout")]
+    Timeout,
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Wraps another error and tells outer retry/fallback layers
+    /// (`do_relay_with_retry`, the exit-node→direct-Apps-Script
+    /// fallback in `relay()`) NOT to replay the request. Used when an
+    /// h2 attempt failed *after* `send_request` succeeded — the
+    /// request may have already reached and been processed by Apps
+    /// Script (or the exit node), and replaying via h1 / direct path
+    /// would duplicate side effects for non-idempotent methods.
+    ///
+    /// `Display` is transparent so error messages look identical to
+    /// the wrapped variant; tests/observability use `is_retryable()`
+    /// and `into_inner()` to introspect.
+    #[error(transparent)]
+    NonRetryable(Box<FronterError>),
+}
+
+impl FronterError {
+    /// True if outer retry/fallback layers may safely re-issue the
+    /// request. False for `NonRetryable(_)` — those errors signal
+    /// "request may have been sent; do not duplicate."
+    pub fn is_retryable(&self) -> bool {
+        !matches!(self, FronterError::NonRetryable(_))
+    }
+
+    /// Strip the `NonRetryable` wrapper, returning the underlying
+    /// error. Useful for surfacing the original message after the
+    /// retry/fallback policy has already done its job.
+    pub fn into_inner(self) -> FronterError {
+        match self {
+            FronterError::NonRetryable(inner) => *inner,
+            other => other,
+        }
+    }
+}
+
+type PooledStream = TlsStream<TcpStream>;
+const POOL_TTL_SECS: u64 = 30;
+const POOL_MIN: usize = 8;
+const POOL_REFILL_INTERVAL_SECS: u64 = 2;
+const POOL_MAX: usize = 80;
+const REQUEST_TIMEOUT_SECS: u64 = 25;
+const RANGE_PARALLEL_CHUNK_BYTES: u64 = 256 * 1024;
+/// HTTP/2 connection lifetime before we proactively reopen. Apps Script's
+/// edge has been observed to send GOAWAY at ~10 min anyway, so we cycle
+/// at 9 min to do an orderly reconnect on our schedule rather than
+/// letting an in-flight stream race a server-initiated close.
+const H2_CONN_TTL_SECS: u64 = 540;
+/// Bound on the h2 ready/back-pressure phase only. `SendRequest::ready()`
+/// awaits a free slot under the server's `MAX_CONCURRENT_STREAMS`. A
+/// stall here means the connection is overloaded (or dead at the
+/// muxer level) but no stream has been opened yet — RequestSent::No,
+/// safe to fall back to h1 without duplication risk. Kept short
+/// (5 s) so a saturated conn doesn't burn the caller's whole budget.
+///
+/// The post-send phase (response headers + body drain) uses the
+/// caller-supplied `response_deadline` instead — see
+/// `h2_round_trip`. This way a slow but legitimate Apps Script call
+/// isn't cut off at an arbitrary fixed cap, and Full-mode batches can
+/// honor the user's `request_timeout_secs` setting.
+const H2_READY_TIMEOUT_SECS: u64 = 3;
+/// Default response-phase deadline used by `relay_uncoalesced` callers
+/// (the Apps-Script direct path). Sized to be just under the outer
+/// `REQUEST_TIMEOUT_SECS` (25 s) so an h2 timeout still leaves a few
+/// seconds of outer budget for an h1 fallback round-trip when the
+/// caller chose to retry.
+const H2_RESPONSE_DEADLINE_DEFAULT_SECS: u64 = 20;
+/// Bound on the TCP connect + TLS handshake + h2 handshake phase. A
+/// blackholed `connect_host:443` previously stalled `ensure_h2` until
+/// the outer 25 s timeout fired (returning 504 without ever falling
+/// back). With this bound, a slow open trips after 8 s and the caller
+/// drops to h1 with ~17 s of outer budget to spare.
+const H2_OPEN_TIMEOUT_SECS: u64 = 8;
+/// After an h2 open failure, suppress further open attempts for this
+/// long. Prevents every concurrent caller during an h2 outage from
+/// paying its own full handshake-timeout cost in turn.
+const H2_OPEN_FAILURE_BACKOFF_SECS: u64 = 15;
+/// Same idea as `H2_OPEN_TIMEOUT_SECS` but for the legacy h1 socket
+/// path. Without this, a stuck TCP connect or TLS handshake to a
+/// blackholed `connect_host:443` would block `acquire()` (and the
+/// `warm()` prewarm loop) until the outer batch budget elapsed —
+/// the same symptom #924 hit during the warm-race window. Bounded
+/// here so a single hung handshake aborts fast and the loop / caller
+/// makes progress on the next attempt.
+const H1_OPEN_TIMEOUT_SECS: u64 = 8;
+/// Cadence for Apps Script container keepalive pings. Apps Script
+/// containers go cold after ~5min idle and cost 1-3s on the first
+/// request to wake back up — most painful on YouTube / streaming where
+/// the first chunk after a quiet pause stalls the player.
+const H1_KEEPALIVE_INTERVAL_SECS: u64 = 60;
+/// Largest response body Apps Script's `UrlFetchApp` will deliver before
+/// the script gets killed mid-execution. The hard wire ceiling is ~50 MiB;
+/// after base64 / envelope overhead and edge variance, the practical raw
+/// ceiling for a single GET sits around 40 MiB. This bounds the
+/// **writer-based** API's streaming threshold: above this, the buffered
+/// stitch path's single-GET fallback wouldn't fit through Apps Script
+/// even if invoked, so streaming chunks straight to the wire (with
+/// truncate-on-failure semantics the client can resume via Range)
+/// strictly beats today's 25 s timeout + 504 "Apps Script
+/// unresponsive" (#1042).
+const APPS_SCRIPT_BODY_MAX_BYTES: u64 = 40 * 1024 * 1024;
+
+/// Hard ceiling on how many bytes the streaming side of the
+/// range-parallel path will fetch for a single response. A hostile
+/// origin can advertise an absurd `Content-Range` total
+/// (`bytes 0-262143/<huge>`), pass our probe-checks with a normally-
+/// sized 256 KiB first-chunk body, and then drive us to keep issuing
+/// chunk Apps Script calls until the client disconnects. Each chunk
+/// is one Apps Script invocation, counting against the account's
+/// daily quota (~20 k requests/day on the free tier), so an
+/// unattended hostile download can exhaust the quota and lock the
+/// user out of the relay entirely.
+///
+/// 16 GiB is well above any legitimate single-file download a user
+/// is likely to do through a relay VPN (game patches, OS images,
+/// video files all fit) but small enough to bound worst-case quota
+/// drain to ~65 k chunks per pwned URL. Above this cap the streaming
+/// branch refuses the response with a 502 instead of plowing
+/// through.
+const MAX_STREAMED_RANGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Byte interval between `range-parallel-stream` progress log lines.
+/// Large downloads through the streaming branch otherwise look stuck
+/// in the logs (one "starting N chunks" line at the top, nothing
+/// until completion or failure). At 16 MiB intervals the operator sees
+/// ~6 lines per 100 MiB and ~64 lines per 1 GiB — useful pace at the
+/// ~1.4 MB/s typical through-relay throughput, and quiet enough that
+/// even a 16 GiB file won't drown the log (~1024 progress lines over
+/// the multi-hour download). Per user feedback on PR #1085.
+const STREAM_PROGRESS_LOG_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Hard ceiling on the buffered stitch buffer's `Vec::with_capacity(total)`
+/// allocation. Two roles:
+///
+///   1. Memory-safety cap. A hostile/buggy origin advertising
+///      `Content-Range: bytes 0-1/<huge>` could otherwise drive
+///      preallocation to enormous values; totals above this either
+///      stream (writer-based API) or fall back to a single GET
+///      (`Vec<u8>` compatibility wrapper, see
+///      [`DomainFronter::relay_parallel_range`]).
+///   2. Pre-1.9.23 compatibility floor for the `Vec<u8>` wrapper.
+///      Range-capable downloads in the 40-64 MiB band used to stitch
+///      successfully via the buffered path; collapsing this constant
+///      into [`APPS_SCRIPT_BODY_MAX_BYTES`] would have pushed those
+///      onto the single-GET fallback path, where Apps Script returns
+///      502/504 because they're above its 50 MiB response ceiling.
+///      Keeping the two cutoffs separate restores that band's
+///      working buffered behavior for wrapper callers.
+const BUFFERED_STITCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+struct PoolEntry {
+    stream: PooledStream,
+    created: Instant,
+}
+
+/// Single shared HTTP/2 connection to the Google edge. One TCP/TLS
+/// socket carries up to ~100 concurrent streams (server's
+/// `MAX_CONCURRENT_STREAMS` setting); each relay request takes a clone
+/// of the `SendRequest` handle and opens its own stream. Cheaper than
+/// the legacy per-request socket pool — no head-of-line blocking when
+/// a single Apps Script call stalls.
+///
+/// `generation` is monotonic per fronter and lets `poison_h2_if_gen`
+/// avoid the race where task A's stale failure clears task B's
+/// freshly-reopened healthy cell.
+///
+/// `dead` is set by the spawned connection-driver task when the h2
+/// `Connection` future ends (GOAWAY, network error, normal close).
+/// Without this, the cell silently held a dead `SendRequest` after a
+/// mid-session disconnect — the next request paid a wasted h2 round
+/// trip to detect it via `ready()` failure, AND `run_pool_refill`
+/// kept maintaining the small `POOL_MIN_H2_FALLBACK` (2-socket) pool
+/// instead of expanding to `POOL_MIN` (8). With the flag,
+/// `run_pool_refill` notices h2 is dead within one tick (≤5 s) and
+/// pre-warms the larger fallback pool before the next request burst,
+/// and `ensure_h2` short-circuits the `H2_CONN_TTL_SECS`-based
+/// liveness check on a known-dead cell.
+struct H2Cell {
+    send: h2::client::SendRequest<Bytes>,
+    created: Instant,
+    generation: u64,
+    dead: Arc<AtomicBool>,
+}
+
+/// "Did this request reach Apps Script?" signal carried out of every
+/// h2 failure so callers know whether replaying via h1 is safe.
+///
+/// - `No`: the failure occurred before `send_request` returned. The
+///   stream was never opened on the wire; replaying through h1 is
+///   guaranteed not to duplicate any side effect.
+/// - `Maybe`: `send_request` succeeded (headers queued for sending)
+///   but a later step failed — server may have already received the
+///   request and may already be processing it. Replaying a
+///   non-idempotent op (POST/PUT/DELETE, tunnel write, batch ops)
+///   risks duplicating side effects. Only safe to retry for methods
+///   that are idempotent by HTTP semantics.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum RequestSent {
+    No,
+    Maybe,
+}
+
+/// Typed errors from `open_h2`. Used so `ensure_h2` can recognize the
+/// "peer refused h2 in ALPN" outcome and sticky-disable the fast path
+/// without resorting to string matching across function boundaries.
+#[derive(Debug, thiserror::Error)]
+enum OpenH2Error {
+    #[error("ALPN did not negotiate h2; peer prefers http/1.1")]
+    AlpnRefused,
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("tls: {0}")]
+    Tls(#[from] rustls::Error),
+    #[error("dns: {0}")]
+    Dns(#[from] rustls::pki_types::InvalidDnsNameError),
+    #[error("h2 handshake: {0}")]
+    Handshake(String),
+}
+
+impl From<OpenH2Error> for FronterError {
+    fn from(e: OpenH2Error) -> Self {
+        match e {
+            OpenH2Error::Io(e) => FronterError::Io(e),
+            OpenH2Error::Tls(e) => FronterError::Tls(e),
+            OpenH2Error::Dns(e) => FronterError::Dns(e),
+            OpenH2Error::AlpnRefused => FronterError::Relay("alpn refused h2".into()),
+            OpenH2Error::Handshake(m) => FronterError::Relay(format!("h2 handshake: {}", m)),
+        }
+    }
+}
+
+pub struct DomainFronter {
+    connect_host: String,
+    /// Pool of SNI domains to rotate through per outbound connection. All of
+    /// them must be hosted on the same Google edge as `connect_host` (that's
+    /// the whole point of domain fronting). Rotating across several of them
+    /// defeats naive DPI that would count "too many connections to a single
+    /// SNI". Populated from config's front_domain: if that's a single name we
+    /// add a small pool of known-safe Google subdomains automatically.
+    sni_hosts: Vec<String>,
+    sni_idx: AtomicUsize,
+    http_host: &'static str,
+    auth_key: String,
+    script_ids: Vec<String>,
+    script_idx: AtomicUsize,
+    /// Fan-out factor: fire this many Apps Script instances in parallel
+    /// per request and return first success. `<= 1` = off.
+    parallel_relay: usize,
+    /// Enable the `normalize_x_graphql` URL rewrite (issue #16, credit
+    /// seramo_ir). When true, GETs to `x.com/i/api/graphql/<hash>/<op>`
+    /// have their query trimmed to the first `variables=` block so the
+    /// response cache isn't busted by the constantly-changing `features`
+    /// / `fieldToggles` params.
+    normalize_x_graphql: bool,
+    /// Set once we've emitted the "UnknownIssuer means ISP MITM" hint,
+    /// so we don't spam it every time a cert-validation error repeats.
+    cert_hint_shown: std::sync::atomic::AtomicBool,
+    /// Connector used by `open_h2`: advertises ALPN `["h2", "http/1.1"]`
+    /// when the h2 fast path is enabled, else just `["http/1.1"]`. Never
+    /// used by the h1 pool path — see `tls_connector_h1`.
+    tls_connector: TlsConnector,
+    /// Connector used by `open()` (h1 pool warm/refill/acquire). ALPN
+    /// is forced to `["http/1.1"]` so a Google edge that would have
+    /// preferred h2 still negotiates h1 here. Without this, pooled
+    /// sockets could end up speaking h2 frames after handshake, and
+    /// the `write_all(b"GET / HTTP/1.1\r\n...")` fallback would land
+    /// on a server that has no idea what we're doing.
+    tls_connector_h1: TlsConnector,
+    pool: Arc<Mutex<Vec<PoolEntry>>>,
+    /// HTTP/2 fast path. `None` until first relay opens it; cleared on
+    /// connection failure or expiry so the next call reopens. Skipped
+    /// entirely when `force_http1` is set or when the peer refused h2
+    /// during ALPN (sticky `h2_disabled`).
+    h2_cell: Arc<Mutex<Option<H2Cell>>>,
+    /// Serializes "open a new h2 connection" attempts so that during
+    /// an outage, only one task pays the handshake cost — concurrent
+    /// callers see the lock contended via `try_lock` and fall through
+    /// to h1 immediately rather than queueing behind a slow handshake.
+    /// Distinct from `h2_cell` so the cell mutex is never held across
+    /// network I/O.
+    h2_open_lock: Arc<Mutex<()>>,
+    /// Wall-clock timestamp of the last failed `open_h2`. While within
+    /// `H2_OPEN_FAILURE_BACKOFF_SECS` of this, `ensure_h2` returns None
+    /// without retrying — prevents thundering-herd handshake attempts
+    /// during transient h2 outages.
+    h2_open_failed_at: Arc<Mutex<Option<Instant>>>,
+    /// Monotonic counter for `H2Cell::generation`. Each successful
+    /// `open_h2` increments and tags the new cell so `poison_h2_if_gen`
+    /// can avoid the race where a stale failure clears a freshly-opened
+    /// cell that another task just installed.
+    h2_generation: Arc<AtomicU64>,
+    /// Set when ALPN negotiates http/1.1 (peer refused h2) or when
+    /// `force_http1` is true. Sticky for the lifetime of the fronter:
+    /// once we know this peer doesn't speak h2, don't keep retrying
+    /// the handshake on every relay call.
+    h2_disabled: Arc<AtomicBool>,
+    cache: Arc<ResponseCache>,
+    inflight: Arc<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>>,
+    coalesced: AtomicU64,
+    blacklist: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// Per-deployment rolling timeout counter. Maps `script_id` →
+    /// `(window_start, strike_count)`. Reset when the window expires
+    /// or when a batch succeeds. Triggers a short-cooldown blacklist
+    /// at `TIMEOUT_STRIKE_LIMIT`. Distinct from `blacklist` because
+    /// strike state is per-deployment health bookkeeping, not the
+    /// permanent ban list.
+    script_timeouts: Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>,
+    relay_calls: AtomicU64,
+    relay_failures: AtomicU64,
+    bytes_relayed: AtomicU64,
+    /// Relay calls that successfully completed over the h2 fast path,
+    /// across **all** entry points: Apps-Script direct relays,
+    /// exit-node outer calls, full-mode tunnel single ops, and
+    /// full-mode tunnel batches.
+    ///
+    /// **Not** comparable to `relay_calls`: that counter only counts
+    /// the Apps-Script-direct path (incremented in `relay_uncoalesced`).
+    /// The other three paths bypass `relay_uncoalesced` entirely, so in
+    /// full-mode deployments `h2_calls` can exceed `relay_calls` —
+    /// reading their ratio as a "% on h2" gives a wrong number.
+    ///
+    /// To gauge h2 health, compute `h2_calls / (h2_calls + h2_fallbacks)`.
+    /// That's the success ratio across all transports; a healthy
+    /// deployment shows > 95 %.
+    h2_calls: AtomicU64,
+    /// Relay calls that attempted h2 but had to fall back to h1
+    /// (transient handshake failure, mid-stream error, conn poisoned,
+    /// open backoff, or `RequestSent::No` failure that the call site
+    /// chose to retry on h1). Same all-entry-points scope as
+    /// `h2_calls`. A persistently high `h2_fallbacks / (h2_calls +
+    /// h2_fallbacks)` ratio indicates an unhealthy h2 conn or a flaky
+    /// middlebox eating h2 frames; consider `force_http1: true`.
+    h2_fallbacks: AtomicU64,
+    /// Per-host breakdown of traffic going through this fronter. Keyed by
+    /// the host of the URL (e.g. "api.x.com"). Read-mostly; only touched
+    /// on the slow path (once per relayed request), so a plain Mutex is
+    /// fine.
+    per_site: Arc<std::sync::Mutex<HashMap<String, HostStat>>>,
+    /// Daily-scoped counters, reset at 00:00 UTC. Tracks what *this
+    /// mhrv-rs process* has observed today — NOT the authoritative
+    /// Apps Script quota bucket on Google's side (which counts across
+    /// every client hitting the same deployment). Useful as a local
+    /// "budget used today" estimate in the UI.
+    ///
+    /// Both counters rebase to zero the first time any recording call
+    /// crosses a UTC date boundary. `day_key` holds "YYYY-MM-DD" of
+    /// the currently-counted day; when we see a new date we swap and
+    /// clear the counters.
+    today_calls: AtomicU64,
+    today_bytes: AtomicU64,
+    today_key: std::sync::Mutex<String>,
+    /// Suppress the random `_pad` field that v1.8.0+ adds to outbound
+    /// payloads. Mirrors `Config::disable_padding` (#391). Default false
+    /// (padding active = stronger DPI defense at +25% bandwidth cost).
+    disable_padding: bool,
+    /// Strip CDN noise headers (report-to, nel, alt-svc, etc.) from the
+    /// relay response before forwarding to the browser. Default true.
+    /// Mirrors `Config::strip_noise_response_headers`. Independent of the
+    /// GAS-side `STRIP_NOISE_RESPONSE_HEADERS` constant in Code.gs — both
+    /// must be false to see fully raw headers.
+    strip_noise_response_headers: bool,
+    zstd_enabled: Arc<AtomicBool>,
+    /// Per-instance auto-blacklist tuning. Mirrors `Config::auto_blacklist_*`
+    /// (#391, #444). Cached here so the hot path in `record_timeout_strike`
+    /// doesn't have to reach back through the Config (which we don't keep
+    /// a reference to).
+    auto_blacklist_strikes: u32,
+    auto_blacklist_window: Duration,
+    auto_blacklist_cooldown: Duration,
+    /// Per-account quota tracker. One bucket per configured script_id,
+    /// each treated as a separate Google account per the model assumption.
+    /// Persists to quota_state.json so quota state survives restarts.
+    quota_tracker: Arc<QuotaTracker>,
+    /// Per-batch HTTP timeout. Mirrors `Config::request_timeout_secs`
+    /// (#430, masterking32 PR #25). Read by `tunnel_client::fire_batch`
+    /// so a single config field tunes the timeout used everywhere.
+    /// Applies to connection establishment and response header arrival only.
+    batch_timeout: Duration,
+    /// Per-chunk body streaming idle timeout. Mirrors `Config::stream_timeout_secs`.
+    /// Applied per-iteration of the body drain loop so large responses
+    /// through Apps Script are not killed mid-transfer by `batch_timeout`.
+    stream_timeout: Duration,
+    /// Optional second-hop exit node (Deno Deploy / fly.io / etc.)
+    /// to bypass CF-anti-bot blocks on sites that flag Google datacenter
+    /// IPs (chatgpt.com, claude.ai, grok.com, x.com). Mirrors
+    /// `Config::exit_node`. When `exit_node_enabled` is false (the more
+    /// common state), all relay traffic takes the regular Apps Script
+    /// path. When true, hosts matching `exit_node_hosts` (or all hosts
+    /// when `exit_node_full`) route through the exit-node URL inside
+    /// the Apps Script call.
+    exit_node_enabled: bool,
+    exit_node_url: String,
+    exit_node_psk: String,
+    exit_node_full: bool,
+    /// Pre-normalized (lowercased, leading-dot stripped) host list for
+    /// fast O(N) match in `exit_node_matches`.
+    exit_node_hosts: Vec<String>,
+}
+
+/// Aggregated stats for one remote host.
+#[derive(Default, Clone, Debug)]
+pub struct HostStat {
+    pub requests: u64,
+    pub cache_hits: u64,
+    pub bytes: u64,
+    pub total_latency_ns: u64,
+}
+
+impl HostStat {
+    pub fn avg_latency_ms(&self) -> f64 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            (self.total_latency_ns as f64) / (self.requests as f64) / 1_000_000.0
+        }
+    }
+}
+
+const BLACKLIST_COOLDOWN_SECS: u64 = 600;
+
+/// Auto-blacklist defaults are now per-instance fields on `DomainFronter`,
+/// driven by `Config::auto_blacklist_strikes` / `_window_secs` /
+/// `_cooldown_secs` (#391, #444). The constants below are gone — see the
+/// `Config` doc comments for tuning guidance and `default_auto_blacklist_*`
+/// for the historical defaults (3 strikes / 30s window / 120s cooldown).
+
+/// Request payload sent to Apps Script (single, non-batch).
+#[derive(Serialize)]
+struct RelayRequest<'a> {
+    k: &'a str,
+    m: &'a str,
+    u: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    h: Option<serde_json::Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    b: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ct: Option<&'a str>,
+    r: bool,
+}
+
+/// Parsed Apps Script response JSON (single mode).
+#[derive(Deserialize, Default)]
+struct RelayResponse {
+    #[serde(default)]
+    s: Option<u16>,
+    #[serde(default)]
+    h: Option<serde_json::Map<String, Value>>,
+    #[serde(default)]
+    b: Option<String>,
+    #[serde(default)]
+    e: Option<String>,
+}
+
+/// Parsed tunnel response JSON (full mode).
+#[derive(Deserialize, Debug, Clone)]
+pub struct TunnelResponse {
+    #[serde(default)]
+    pub sid: Option<String>,
+    #[serde(default)]
+    pub d: Option<String>,
+    /// UDP datagrams returned by tunnel-node, base64-encoded individually.
+    #[serde(default)]
+    pub pkts: Option<Vec<String>>,
+    #[serde(default)]
+    pub eof: Option<bool>,
+    #[serde(default)]
+    pub e: Option<String>,
+    /// Structured error code from the tunnel-node (e.g. `UNSUPPORTED_OP`).
+    /// `None` for legacy tunnel-nodes; clients should fall back to parsing
+    /// `e` only when this is `None` and compatibility is needed.
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub seq: Option<u64>,
+}
+
+/// A single op in a batch tunnel request.
+#[derive(Serialize, Clone, Debug)]
+pub struct BatchOp {
+    pub op: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub d: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wseq: Option<u64>,
+}
+
+/// Batch tunnel response from Apps Script / tunnel node.
+#[derive(Deserialize, Debug)]
+pub struct BatchTunnelResponse {
+    #[serde(default)]
+    pub r: Vec<TunnelResponse>,
+    #[serde(default)]
+    pub e: Option<String>,
+    #[serde(default)]
+    pub zr: Option<String>,
+    #[serde(default)]
+    pub zc: Option<u8>,
+}
+
+impl DomainFronter {
+    pub fn new(config: &Config) -> Result<Self, FronterError> {
+        let script_ids = config.script_ids_resolved();
+        if script_ids.is_empty() {
+            return Err(FronterError::Relay("no script_id configured".into()));
+        }
+        // Helper that builds a fresh ClientConfig with the verifier
+        // policy from config. We need two of these so the h2-capable
+        // and h1-only paths can advertise different ALPN sets without
+        // mutating one shared config across calls.
+        let build_tls_config = || {
+            if config.verify_ssl {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth()
+            } else {
+                ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoVerify))
+                    .with_no_client_auth()
+            }
+        };
+
+        // Connector for `open_h2`: advertises h2 first (or just h1 if
+        // the kill switch is set, in which case both connectors end up
+        // identical — fine, just slightly redundant).
+        let mut tls_h2 = build_tls_config();
+        if !config.force_http1 {
+            tls_h2.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        } else {
+            tls_h2.alpn_protocols = vec![b"http/1.1".to_vec()];
+        }
+        let tls_connector = TlsConnector::from(Arc::new(tls_h2));
+
+        // Connector for `open()` (h1 pool path). ALPN is forced to
+        // http/1.1 so a Google edge that would otherwise prefer h2
+        // still negotiates h1 here — pooled sockets always speak the
+        // protocol the fallback path expects.
+        let mut tls_h1 = build_tls_config();
+        tls_h1.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let tls_connector_h1 = TlsConnector::from(Arc::new(tls_h1));
+
+        // Build quota tracker before script_ids is moved into the struct.
+        let quota_tracker_arc = Arc::new(QuotaTracker::load(
+            &script_ids,
+            config.quota_daily_limit,
+            config.quota_safety_buffer,
+        ));
+
+        Ok(Self {
+            connect_host: config.google_ip.clone(),
+            sni_hosts: build_sni_pool_for(
+                &config.front_domain,
+                config.sni_hosts.as_deref().unwrap_or(&[]),
+            ),
+            sni_idx: AtomicUsize::new(0),
+            http_host: "script.google.com",
+            auth_key: config.auth_key.clone(),
+            parallel_relay: config.parallel_relay as usize,
+            normalize_x_graphql: config.normalize_x_graphql,
+            cert_hint_shown: std::sync::atomic::AtomicBool::new(false),
+            script_ids,
+            script_idx: AtomicUsize::new(0),
+            tls_connector,
+            tls_connector_h1,
+            pool: Arc::new(Mutex::new(Vec::new())),
+            h2_cell: Arc::new(Mutex::new(None)),
+            h2_open_lock: Arc::new(Mutex::new(())),
+            h2_open_failed_at: Arc::new(Mutex::new(None)),
+            h2_generation: Arc::new(AtomicU64::new(0)),
+            h2_disabled: Arc::new(AtomicBool::new(config.force_http1)),
+            cache: Arc::new(ResponseCache::with_default()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+            coalesced: AtomicU64::new(0),
+            blacklist: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            script_timeouts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            relay_calls: AtomicU64::new(0),
+            relay_failures: AtomicU64::new(0),
+            bytes_relayed: AtomicU64::new(0),
+            h2_calls: AtomicU64::new(0),
+            h2_fallbacks: AtomicU64::new(0),
+            per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            today_calls: AtomicU64::new(0),
+            today_bytes: AtomicU64::new(0),
+            today_key: std::sync::Mutex::new(current_pt_day_key()),
+            disable_padding: config.disable_padding,
+            strip_noise_response_headers: config.strip_noise_response_headers,
+            zstd_enabled: Arc::new(AtomicBool::new(false)),
+            auto_blacklist_strikes: config.auto_blacklist_strikes.max(1),
+            auto_blacklist_window: Duration::from_secs(
+                config.auto_blacklist_window_secs.clamp(1, 3600),
+            ),
+            auto_blacklist_cooldown: Duration::from_secs(
+                config.auto_blacklist_cooldown_secs.clamp(1, 86400),
+            ),
+            quota_tracker: quota_tracker_arc,
+            batch_timeout: Duration::from_secs(
+                config.request_timeout_secs.clamp(5, 300),
+            ),
+            stream_timeout: Duration::from_secs(
+                config.stream_timeout_secs.clamp(10, 3600),
+            ),
+            exit_node_enabled: config.exit_node.enabled
+                && !config.exit_node.relay_url.is_empty()
+                && !config.exit_node.psk.is_empty(),
+            exit_node_url: config
+                .exit_node
+                .relay_url
+                .trim_end_matches('/')
+                .to_string(),
+            exit_node_psk: config.exit_node.psk.clone(),
+            exit_node_full: matches!(
+                config.exit_node.mode.to_ascii_lowercase().as_str(),
+                "full"
+            ),
+            exit_node_hosts: config
+                .exit_node
+                .hosts
+                .iter()
+                .map(|h| h.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        })
+    }
+
+    /// True when the configured exit node should handle this URL.
+    /// In `selective` mode (default), checks the host against the
+    /// pre-normalized `exit_node_hosts` list (exact match OR
+    /// dot-anchored suffix, mirroring `passthrough_hosts` semantics).
+    /// In `full` mode, every URL routes through the exit node.
+    pub(crate) fn exit_node_matches(&self, url: &str) -> bool {
+        if !self.exit_node_enabled {
+            return false;
+        }
+        if self.exit_node_full {
+            return true;
+        }
+        let host = match extract_host(url) {
+            Some(h) => h,
+            None => return false,
+        };
+        let host_lc = host.to_ascii_lowercase();
+        for entry in &self.exit_node_hosts {
+            if host_lc == *entry || host_lc.ends_with(&format!(".{}", entry)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Per-batch HTTP round-trip timeout. Read by `tunnel_client` so the
+    /// `BATCH_TIMEOUT` constant doesn't have to be touched on every config
+    /// change. Clamped to `[5s, 300s]` at construction.
+    pub(crate) fn batch_timeout(&self) -> Duration {
+        self.batch_timeout
+    }
+
+    /// Per-chunk body streaming idle timeout. Clamped to `[10s, 3600s]`.
+    pub(crate) fn stream_timeout(&self) -> Duration {
+        self.stream_timeout
+    }
+
+    /// Record one relay call toward the daily budget. Called once per
+    /// outbound Apps Script fetch. Rolls over both daily counters at
+    /// 00:00 Pacific Time, matching Apps Script's quota reset cadence
+    /// (#230, #362). Crate-public so the Full-mode batch path in
+    /// `tunnel_client::fire_batch` can wire into the same accounting
+    /// (Apps Script sees Full-mode batches as ordinary `UrlFetchApp`
+    /// calls and counts them against the same daily quota).
+    pub(crate) fn record_today(&self, bytes: u64) {
+        let today = current_pt_day_key();
+        // Fast path: same day as what we last saw. No lock.
+        let mut guard = self.today_key.lock().unwrap();
+        if *guard != today {
+            // Date rolled over — reset counters before this call is counted.
+            *guard = today;
+            self.today_calls.store(0, Ordering::Relaxed);
+            self.today_bytes.store(0, Ordering::Relaxed);
+        }
+        drop(guard);
+        self.today_calls.fetch_add(1, Ordering::Relaxed);
+        self.today_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Increment the per-site counters. Called on every logical request
+    /// (both cache hits and relay roundtrips).
+    fn record_site(&self, url: &str, cache_hit: bool, bytes: u64, latency_ns: u64) {
+        let host = match extract_host(url) {
+            Some(h) => h,
+            None => return,
+        };
+        let mut m = self.per_site.lock().unwrap();
+        let e = m.entry(host).or_default();
+        e.requests += 1;
+        if cache_hit {
+            e.cache_hits += 1;
+        }
+        e.bytes += bytes;
+        e.total_latency_ns += latency_ns;
+    }
+
+    /// Snapshot per-site stats, sorted by request count descending.
+    pub fn snapshot_per_site(&self) -> Vec<(String, HostStat)> {
+        let m = self.per_site.lock().unwrap();
+        let mut v: Vec<(String, HostStat)> =
+            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        v.sort_by(|a, b| b.1.requests.cmp(&a.1.requests));
+        v
+    }
+
+    pub fn snapshot_stats(&self) -> StatsSnapshot {
+        let bl = self.blacklist.lock().unwrap();
+        // Read today_key under lock and cheaply check rollover so the
+        // UI never sees stale "today_calls=1847" on a day where no
+        // traffic has flowed yet (e.g. user left the app open past
+        // midnight PT).
+        let today_now = current_pt_day_key();
+        let today_key = {
+            let mut guard = self.today_key.lock().unwrap();
+            if *guard != today_now {
+                *guard = today_now.clone();
+                self.today_calls.store(0, Ordering::Relaxed);
+                self.today_bytes.store(0, Ordering::Relaxed);
+            }
+            guard.clone()
+        };
+        let quota = self.quota_tracker.summary();
+        StatsSnapshot {
+            total_relay_calls: quota.total_relay_calls,
+            relay_calls: self.relay_calls.load(Ordering::Relaxed),
+            relay_failures: self.relay_failures.load(Ordering::Relaxed),
+            coalesced: self.coalesced.load(Ordering::Relaxed),
+            bytes_relayed: self.bytes_relayed.load(Ordering::Relaxed),
+            cache_hits: self.cache.hits(),
+            cache_misses: self.cache.misses(),
+            cache_bytes: self.cache.size(),
+            blacklisted_scripts: bl.len(),
+            total_scripts: self.script_ids.len(),
+            today_calls: self.today_calls.load(Ordering::Relaxed),
+            today_bytes: self.today_bytes.load(Ordering::Relaxed),
+            today_key,
+            today_reset_secs: seconds_until_pacific_midnight(),
+            h2_calls: self.h2_calls.load(Ordering::Relaxed),
+            h2_fallbacks: self.h2_fallbacks.load(Ordering::Relaxed),
+            h2_disabled: self.h2_disabled.load(Ordering::Relaxed),
+            quota,
+        }
+    }
+
+    /// Access the quota tracker for periodic saves and startup logging.
+    pub fn quota_tracker(&self) -> &Arc<QuotaTracker> {
+        &self.quota_tracker
+    }
+
+    pub fn num_scripts(&self) -> usize {
+        self.script_ids.len()
+    }
+
+    pub fn script_id_list(&self) -> &[String] {
+        &self.script_ids
+    }
+
+    pub fn cache(&self) -> &ResponseCache {
+        &self.cache
+    }
+
+    pub fn coalesced_count(&self) -> u64 {
+        self.coalesced.load(Ordering::Relaxed)
+    }
+
+    pub fn next_script_id(&self) -> String {
+        let n = self.script_ids.len();
+        let mut bl = self.blacklist.lock().unwrap();
+        let now = Instant::now();
+        bl.retain(|_, until| *until > now);
+
+        for _ in 0..n {
+            let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
+            let sid = &self.script_ids[idx % n];
+            if !bl.contains_key(sid) && !self.quota_tracker.is_hard_stopped(sid) {
+                return sid.clone();
+            }
+        }
+        // Fallback: prefer a blacklisted-but-not-quota-exhausted account
+        // over a fully quota-exhausted one (blacklist is transient, quota
+        // exhaustion is per-window).
+        let not_exhausted: Vec<_> = bl
+            .iter()
+            .filter(|(sid, _)| !self.quota_tracker.is_hard_stopped(sid))
+            .collect();
+        if let Some((sid, _)) = not_exhausted.iter().min_by_key(|(_, t)| **t) {
+            let sid = sid.to_string();
+            bl.remove(&sid);
+            return sid;
+        }
+        // All accounts are either quota-exhausted or blacklisted. The global
+        // hard-stop check in do_relay_with_retry will handle the quota case.
+        // Fall back to soonest-off-blacklist cooldown as a last resort.
+        if let Some((sid, _)) = bl.iter().min_by_key(|(_, t)| **t) {
+            let sid = sid.clone();
+            bl.remove(&sid);
+            return sid;
+        }
+        self.script_ids[0].clone()
+    }
+
+    /// Pick `want` distinct non-blacklisted script IDs for a parallel fan-out
+    /// dispatch. Returns fewer than `want` if there aren't enough non-blacklisted
+    /// IDs available. Advances the round-robin index by `want` to spread load
+    /// across subsequent calls.
+    fn next_script_ids(&self, want: usize) -> Vec<String> {
+        let n = self.script_ids.len();
+        if n == 0 {
+            return vec![];
+        }
+        let mut bl = self.blacklist.lock().unwrap();
+        let now = Instant::now();
+        bl.retain(|_, until| *until > now);
+
+        let mut picked: Vec<String> = Vec::with_capacity(want);
+        for _ in 0..n {
+            if picked.len() >= want {
+                break;
+            }
+            let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
+            let sid = &self.script_ids[idx % n];
+            if !bl.contains_key(sid)
+                && !self.quota_tracker.is_hard_stopped(sid)
+                && !picked.iter().any(|p| p == sid)
+            {
+                picked.push(sid.clone());
+            }
+        }
+        if picked.is_empty() {
+            picked.push(self.script_ids[0].clone());
+        }
+        picked
+    }
+
+    fn blacklist_script(&self, script_id: &str, reason: &str) {
+        self.blacklist_script_for(
+            script_id,
+            Duration::from_secs(BLACKLIST_COOLDOWN_SECS),
+            reason,
+        );
+    }
+
+    fn blacklist_script_for(&self, script_id: &str, cooldown: Duration, reason: &str) {
+        let until = Instant::now() + cooldown;
+        let mut bl = self.blacklist.lock().unwrap();
+        bl.insert(script_id.to_string(), until);
+        tracing::warn!(
+            "blacklisted script {} for {}s: {}",
+            mask_script_id(script_id),
+            cooldown.as_secs(),
+            reason
+        );
+    }
+
+    /// Record a batch timeout against `script_id`. After
+    /// `TIMEOUT_STRIKE_LIMIT` timeouts inside `TIMEOUT_STRIKE_WINDOW`
+    /// the deployment is blacklisted with a short cooldown so the
+    /// round-robin stops sending real traffic to a deployment that's
+    /// hung (most commonly: stale `TUNNEL_SERVER_URL` after the
+    /// tunnel-node moved hosts).
+    pub(crate) fn record_timeout_strike(&self, script_id: &str) {
+        let now = Instant::now();
+        let mut counts = self.script_timeouts.lock().unwrap();
+        let entry = counts
+            .entry(script_id.to_string())
+            .or_insert((now, 0));
+        if now.duration_since(entry.0) > self.auto_blacklist_window {
+            *entry = (now, 1);
+        } else {
+            entry.1 += 1;
+        }
+        let strikes = entry.1;
+        if strikes >= self.auto_blacklist_strikes {
+            counts.remove(script_id);
+            drop(counts);
+            self.blacklist_script_for(
+                script_id,
+                self.auto_blacklist_cooldown,
+                &format!(
+                    "{} timeouts in {}s",
+                    strikes,
+                    self.auto_blacklist_window.as_secs()
+                ),
+            );
+        }
+    }
+
+    /// Clear the timeout strike counter for `script_id`. Called after
+    /// a batch succeeds so a recovered deployment doesn't keep stale
+    /// strikes from hours ago — three strikes must occur within one
+    /// real failure burst, not accumulate across unrelated incidents.
+    pub(crate) fn record_batch_success(&self, script_id: &str) {
+        let mut counts = self.script_timeouts.lock().unwrap();
+        counts.remove(script_id);
+    }
+
+    /// Log a relay failure with extra guidance on cert-validation cases.
+    /// Rate-limited so a flood of identical "UnknownIssuer" errors doesn't
+    /// fill the log.
+    fn log_relay_failure(&self, e: &FronterError) {
+        let msg = e.to_string();
+        let is_cert_issue = msg.contains("UnknownIssuer")
+            || msg.contains("invalid peer certificate")
+            || msg.contains("CertificateExpired")
+            || msg.contains("CertNotValidYet")
+            || msg.contains("NotValidForName");
+        if is_cert_issue
+            && !self
+                .cert_hint_shown
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            // First time — print the full diagnostic. Subsequent hits
+            // drop to debug so the log stays readable.
+            tracing::error!(
+                "Relay failed: {} — this almost always means one of:\n  \
+                 (1) your ISP or a middlebox is intercepting TLS to the Google edge \
+                 (common in Iran / IR);\n  \
+                 (2) the `google_ip` in your config is pointing at a non-Google host;\n  \
+                 (3) your system clock is way off (NTP not synced).\n\
+                 Fixes (try in order): run `mhrv-rs scan-ips` to find a different Google \
+                 frontend IP that isn't being MITM'd; check `date` on your host; as a \
+                 LAST RESORT set `verify_ssl = false` in config.toml — this lets the \
+                 relay work even through a middlebox, but your traffic is then only \
+                 protected by the Apps Script relay's secret `auth_key`, not by outer TLS.",
+                e
+            );
+        } else if is_cert_issue {
+            tracing::debug!("Relay failed (cert): {}", e);
+        } else {
+            tracing::error!("Relay failed: {}", e);
+        }
+    }
+
+    fn next_sni(&self) -> String {
+        let n = self.sni_hosts.len();
+        let i = self.sni_idx.fetch_add(1, Ordering::Relaxed) % n;
+        self.sni_hosts[i].clone()
+    }
+
+    async fn open(&self) -> Result<PooledStream, FronterError> {
+        // Bounded TCP+TLS open. See `H1_OPEN_TIMEOUT_SECS`.
+        let work = async {
+            let tcp = TcpStream::connect((self.connect_host.as_str(), 443u16)).await?;
+            let _ = tcp.set_nodelay(true);
+            let sni = self.next_sni();
+            let name = ServerName::try_from(sni)?;
+            // Always use the h1-only connector here — the pool only holds
+            // sockets that the raw HTTP/1.1 fallback path can write to.
+            // Using the shared connector would let some pooled sockets
+            // negotiate h2, which would then misframe every fallback
+            // request that lands on them.
+            let tls = self.tls_connector_h1.connect(name, tcp).await?;
+            Ok::<_, FronterError>(tls)
+        };
+        match tokio::time::timeout(Duration::from_secs(H1_OPEN_TIMEOUT_SECS), work).await {
+            Ok(r) => r,
+            Err(_) => Err(FronterError::Relay(format!(
+                "h1 open timed out after {}s",
+                H1_OPEN_TIMEOUT_SECS
+            ))),
+        }
+    }
+
+    /// Open outbound TLS connections eagerly so the first relay request
+    /// doesn't pay a cold handshake.
+    ///
+    /// h2 and h1 prewarm run in parallel: a request that arrives while
+    /// the h2 handshake is still in flight (or has just hit its 8 s
+    /// timeout) needs a warm h1 socket waiting for it, otherwise the
+    /// h1 fallback path pays a cold handshake on the same slow network
+    /// and the 30 s outer batch budget elapses (#924). v1.9.14 warmed
+    /// h1 unconditionally; v1.9.15 (PR #799) accidentally gated the h1
+    /// prewarm behind `ensure_h2()` so the h1 pool stayed empty during
+    /// the h2 init window.
+    ///
+    /// The spawned h2 handshake races h1[0] — boot fires two TLS
+    /// handshakes back-to-back. The 500 ms stagger only applies between
+    /// h1[i] and h1[i+1] for i ≥ 1, so we don't burst the remaining
+    /// h1[1..n] handshakes at the Google edge simultaneously. Each
+    /// connection gets an 8 s expiry offset so they roll off gradually
+    /// instead of all hitting POOL_TTL_SECS at once. If h2 ends up the
+    /// active fast path, `run_pool_refill` trims the pool back down to
+    /// `POOL_MIN_H2_FALLBACK` on the next tick — the extra warm h1
+    /// sockets just age out naturally instead of being kept alive.
+    pub async fn warm(self: &Arc<Self>, n: usize) {
+        // Spawn the h2 prewarm in parallel so the h1 prewarm loop
+        // below isn't blocked on it. Capturing the join handle lets
+        // us still log "h2 fast path active" / "h1 fallback only"
+        // accurately at the end.
+        let h2_self = self.clone();
+        let h2_handle = tokio::spawn(async move {
+            !h2_self.h2_disabled.load(Ordering::Relaxed)
+                && h2_self.ensure_h2().await.is_some()
+        });
+
+        let mut warmed = 0usize;
+        for i in 0..n {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            match self.open().await {
+                Ok(s) => {
+                    let entry = PoolEntry {
+                        stream: s,
+                        created: Instant::now() - Duration::from_secs(8 * i as u64),
+                    };
+                    let mut pool = self.pool.lock().await;
+                    if pool.len() < POOL_MAX {
+                        pool.push(entry);
+                        warmed += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("pool warm: open failed: {}", e);
+                }
+            }
+        }
+        // Join the h2 prewarm here only to log whether it landed; the
+        // h1 pool above is already populated either way. A panic in
+        // the spawned task surfaces as `JoinError` — log it explicitly
+        // so it isn't indistinguishable from a clean ALPN refusal.
+        let h2_alive = match h2_handle.await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("h2 prewarm task failed to join: {}", e);
+                false
+            }
+        };
+        if h2_alive {
+            tracing::info!(
+                "h2 fast path active; h1 fallback pool pre-warmed with {} connection(s)",
+                warmed
+            );
+        } else if warmed > 0 {
+            tracing::info!("pool pre-warmed with {} connection(s)", warmed);
+        }
+    }
+
+    /// Background loop that keeps the h1 pool warm.
+    ///
+    /// Always maintains `POOL_MIN` (8) connections. Full-tunnel mode
+    /// uses the h1 pool for all batch traffic (h2 is skipped for
+    /// tunnel batches), so the pool must stay at full capacity
+    /// regardless of h2 status. Relay mode also benefits from a warm
+    /// pool as h1 fallback.
+    ///
+    /// A connection only counts toward the minimum if it has at least
+    /// 20 s of TTL remaining — nearly-expired entries don't help.
+    /// Checks every `POOL_REFILL_INTERVAL_SECS`, evicts expired entries,
+    /// and opens replacements one at a time so there's no burst.
+    pub async fn run_pool_refill(self: Arc<Self>) {
+        const MIN_REMAINING_SECS: u64 = 20;
+        loop {
+            tokio::time::sleep(Duration::from_secs(POOL_REFILL_INTERVAL_SECS)).await;
+
+            // Evict expired entries first.
+            {
+                let mut pool = self.pool.lock().await;
+                pool.retain(|e| e.created.elapsed().as_secs() < POOL_TTL_SECS);
+            }
+
+            let target = POOL_MIN;
+
+            // Count only connections with enough life left.
+            // Refill one at a time to avoid bursting TLS handshakes.
+            loop {
+                let healthy = {
+                    let pool = self.pool.lock().await;
+                    pool.iter()
+                        .filter(|e| {
+                            let age = e.created.elapsed().as_secs();
+                            age + MIN_REMAINING_SECS < POOL_TTL_SECS
+                        })
+                        .count()
+                };
+                if healthy >= target {
+                    break;
+                }
+                match self.open().await {
+                    Ok(s) => {
+                        let mut pool = self.pool.lock().await;
+                        if pool.len() < POOL_MAX {
+                            pool.push(PoolEntry {
+                                stream: s,
+                                created: Instant::now(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("pool refill: open failed: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keep the Apps Script container warm with a periodic HEAD ping.
+    ///
+    /// The TCP/TLS pool stays warm via `run_pool_refill`, but the V8
+    /// container Apps Script runs in goes cold ~5min after the last
+    /// `UrlFetchApp` call and costs 1-3s to spin back up. The symptom
+    /// is "first request after a quiet period stalls" — most visible
+    /// on YouTube where the player gives up on a 1.5s `googlevideo.com`
+    /// chunk that's actually waiting on a cold-start.
+    ///
+    /// Transport-agnostic: the underlying call goes through the same
+    /// `relay_uncoalesced` path everything else uses, so when h2 is
+    /// up the keepalive rides the multiplexed connection too.
+    ///
+    /// Bypasses the response cache (`cache_key_opt = None`) and the
+    /// inflight coalescer — otherwise the second iteration would just
+    /// hit the cached response from the first and never reach Apps
+    /// Script. The relay payload itself is the cheapest non-error one
+    /// we can build: a HEAD against `http://example.com/` returns a few
+    /// hundred bytes, no body decode, no auth.
+    ///
+    /// Best-effort. Failures are debug-logged so a flaky network or
+    /// quota-exhausted account doesn't spam warnings every 4 minutes.
+    /// Loops forever — caller is expected to drop the JoinHandle on
+    /// shutdown (the task lives as long as the process).
+    pub async fn run_keepalive(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(H1_KEEPALIVE_INTERVAL_SECS)).await;
+            let t0 = Instant::now();
+            // relay_uncoalesced returns Vec<u8> (always — errors are
+            // baked into 5xx responses), so just observe the duration
+            // for the debug line. We intentionally don't use relay()
+            // here because that path goes through the cache + coalesce
+            // layer, which would short-circuit subsequent pings.
+            let _ = self
+                .relay_uncoalesced("HEAD", "http://example.com/", &[], &[], None)
+                .await;
+            tracing::debug!(
+                "container keepalive: {}ms",
+                t0.elapsed().as_millis()
+            );
+        }
+    }
+
+    async fn acquire(&self) -> Result<PoolEntry, FronterError> {
+        {
+            let mut pool = self.pool.lock().await;
+            // Evict expired, then hand out the freshest (most remaining TTL).
+            pool.retain(|e| e.created.elapsed().as_secs() < POOL_TTL_SECS);
+            if !pool.is_empty() {
+                // Freshest = smallest elapsed time. swap_remove is O(1).
+                let freshest = pool
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.created.elapsed())
+                    .map(|(i, _)| i)
+                    .unwrap();
+                return Ok(pool.swap_remove(freshest));
+            }
+        }
+        let stream = self.open().await?;
+        Ok(PoolEntry {
+            stream,
+            created: Instant::now(),
+        })
+    }
+
+    async fn release(&self, entry: PoolEntry) {
+        if entry.created.elapsed().as_secs() >= POOL_TTL_SECS {
+            return;
+        }
+        let mut pool = self.pool.lock().await;
+        if pool.len() < POOL_MAX {
+            pool.push(entry);
+        }
+    }
+
+    /// Return a cloned `SendRequest` handle (paired with its cell
+    /// generation) to the active HTTP/2 connection, opening a new one
+    /// if needed. `None` means the h2 fast path is unavailable for
+    /// this call — the caller should fall through to the h1 path.
+    ///
+    /// Reasons we may return `None`:
+    ///   - `force_http1` set, or peer previously refused h2 via ALPN
+    ///     (sticky `h2_disabled`).
+    ///   - We're inside the `H2_OPEN_FAILURE_BACKOFF_SECS` cooldown
+    ///     after a recent open failure.
+    ///   - Another task is currently opening a connection and we
+    ///     don't want to pile on (`try_lock` on `h2_open_lock`).
+    ///   - The open we just attempted timed out within
+    ///     `H2_OPEN_TIMEOUT_SECS` or otherwise failed.
+    ///
+    /// The lock on `h2_cell` is *never* held across network I/O —
+    /// that's the whole point of `h2_open_lock`. Concurrent first-time
+    /// callers compete for `h2_open_lock` via `try_lock`; the loser
+    /// returns None immediately and uses h1 rather than serializing
+    /// behind a slow handshake.
+    ///
+    /// The returned generation lets the caller later
+    /// `poison_h2_if_gen(gen)` to clear *only* this specific cell on
+    /// per-stream error, avoiding the race where a stale failure
+    /// clobbers a freshly-reopened healthy cell.
+    async fn ensure_h2(&self) -> Option<(h2::client::SendRequest<Bytes>, u64)> {
+        if self.h2_disabled.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        // Fast path: existing cell, within TTL and not flagged dead by
+        // the connection driver. We can't peek at SendRequest liveness
+        // synchronously (h2 0.4 doesn't expose `is_closed`), but the
+        // driver task does flip `dead` when the underlying connection
+        // ends — so a known-dead cell is rejected here without paying
+        // a wasted h2 round trip to discover it.
+        {
+            let cell = self.h2_cell.lock().await;
+            if let Some(c) = cell.as_ref() {
+                if c.created.elapsed().as_secs() < H2_CONN_TTL_SECS
+                    && !c.dead.load(Ordering::Relaxed)
+                {
+                    return Some((c.send.clone(), c.generation));
+                }
+            }
+        }
+
+        // Backoff check — recent open failure means h2 is currently
+        // unhealthy; don't pile on retries until the window expires.
+        {
+            let last = self.h2_open_failed_at.lock().await;
+            if let Some(t) = *last {
+                if t.elapsed().as_secs() < H2_OPEN_FAILURE_BACKOFF_SECS {
+                    return None;
+                }
+            }
+        }
+
+        // Open dedup: only one task does the actual handshake at a
+        // time. Concurrent callers see the lock contended and fall
+        // through to h1 immediately — preserves cold-start latency
+        // for the burst that arrives during a slow open.
+        let _open_guard = match self.h2_open_lock.try_lock() {
+            Ok(g) => g,
+            Err(_) => return None,
+        };
+
+        // Re-check the cell under open_lock — another task may have
+        // just stored a fresh connection while we were arbitrating.
+        {
+            let cell = self.h2_cell.lock().await;
+            if let Some(c) = cell.as_ref() {
+                if c.created.elapsed().as_secs() < H2_CONN_TTL_SECS
+                    && !c.dead.load(Ordering::Relaxed)
+                {
+                    return Some((c.send.clone(), c.generation));
+                }
+            }
+        }
+
+        // Bounded handshake. A blackholed connect target can stall
+        // for many seconds otherwise, eating the outer budget that
+        // should be reserved for an h1 fallback round-trip.
+        let open_result =
+            tokio::time::timeout(Duration::from_secs(H2_OPEN_TIMEOUT_SECS), self.open_h2())
+                .await;
+
+        let (send, dead) = match open_result {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(OpenH2Error::AlpnRefused)) => {
+                // Definitive: this peer doesn't speak h2. Sticky-disable
+                // so we never re-attempt the handshake.
+                self.h2_disabled.store(true, Ordering::Relaxed);
+                tracing::info!(
+                    "relay peer refused h2 via ALPN; staying on http/1.1"
+                );
+                *self.h2_cell.lock().await = None;
+                return None;
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("h2 open failed: {} — falling back to h1", e);
+                *self.h2_open_failed_at.lock().await = Some(Instant::now());
+                *self.h2_cell.lock().await = None;
+                return None;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "h2 open timed out after {}s — falling back to h1",
+                    H2_OPEN_TIMEOUT_SECS
+                );
+                *self.h2_open_failed_at.lock().await = Some(Instant::now());
+                *self.h2_cell.lock().await = None;
+                return None;
+            }
+        };
+
+        // Open succeeded. Tag with a fresh generation, store, return.
+        // Clear any stale backoff timestamp.
+        let generation = self.h2_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        *self.h2_open_failed_at.lock().await = None;
+        let mut cell = self.h2_cell.lock().await;
+        *cell = Some(H2Cell {
+            send: send.clone(),
+            created: Instant::now(),
+            generation,
+            dead,
+        });
+        Some((send, generation))
+    }
+
+    /// Open one TLS connection and run the h2 handshake. Returns a
+    /// typed `OpenH2Error` so the caller can recognize ALPN refusal
+    /// (sticky disable) without string-matching across boundaries.
+    /// The returned `Arc<AtomicBool>` is the death flag the connection
+    /// driver flips when the h2 `Connection` future ends.
+    async fn open_h2(
+        &self,
+    ) -> Result<(h2::client::SendRequest<Bytes>, Arc<AtomicBool>), OpenH2Error> {
+        let tcp = TcpStream::connect((self.connect_host.as_str(), 443u16)).await?;
+        let _ = tcp.set_nodelay(true);
+        let sni = self.next_sni();
+        let name = ServerName::try_from(sni)?;
+        let tls = self.tls_connector.connect(name, tcp).await?;
+        Self::h2_handshake_post_tls(tls).await
+    }
+
+    /// Post-TLS portion of the h2 open path: ALPN check + h2 handshake
+    /// + connection-driver task spawn. Split out from `open_h2` so
+    /// tests can drive it with a TLS stream from any local server,
+    /// bypassing the hard-coded `connect_host:443` target.
+    async fn h2_handshake_post_tls(
+        tls: PooledStream,
+    ) -> Result<(h2::client::SendRequest<Bytes>, Arc<AtomicBool>), OpenH2Error> {
+        let alpn_h2 = tls
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|p| p == b"h2")
+            .unwrap_or(false);
+        if !alpn_h2 {
+            return Err(OpenH2Error::AlpnRefused);
+        }
+        // Larger initial windows mean we don't have to call
+        // `release_capacity` on every chunk for typical Apps Script
+        // payloads (usually < 1 MB; range chunks are 256 KB). We still
+        // release capacity in the body-read loop for safety on larger
+        // bodies. 16/32 MB windows eliminate stalls for range-parallel
+        // streaming (256 KB chunks × many streams) without adding memory
+        // overhead on idle connections (the window is just a counter until
+        // data flows).
+        let (send, conn) = h2::client::Builder::new()
+            .initial_window_size(16 * 1024 * 1024)
+            .initial_connection_window_size(32 * 1024 * 1024)
+            .handshake(tls)
+            .await
+            .map_err(|e| OpenH2Error::Handshake(e.to_string()))?;
+        // The connection task drives frame I/O independently of any
+        // SendRequest handle. When it ends (GOAWAY, network error, TTL),
+        // we flip the `dead` flag so `ensure_h2` and `run_pool_refill`
+        // can react within one refill tick instead of waiting for a
+        // request to discover the breakage via `ready()` failure.
+        let dead = Arc::new(AtomicBool::new(false));
+        let dead_for_driver = dead.clone();
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::debug!("h2 connection closed: {}", e);
+            }
+            dead_for_driver.store(true, Ordering::Relaxed);
+        });
+        tracing::info!("h2 connection established to relay edge");
+        Ok((send, dead))
+    }
+
+    /// React to an h2-fronting-incompatibility HTTP response (status
+    /// matched by `is_h2_fronting_refusal_status`) by:
+    ///   * sticky-disabling the h2 fast path so subsequent calls go
+    ///     straight to h1 without re-paying the handshake / refusal,
+    ///   * clearing any current cell so the SendRequest is dropped,
+    ///   * rebalancing the h2 stat counters so this request shows
+    ///     up as a fallback, not a successful h2 call. (The
+    ///     `run_h2_relay_with_send` Ok path bumps `h2_calls` for any
+    ///     completed round-trip; for a 421 we want it counted as
+    ///     `h2_fallbacks` instead since the request will take the
+    ///     h1 path.)
+    /// Logs at info because this is a meaningful state transition for
+    /// the deployment, not a per-request hiccup.
+    async fn sticky_disable_h2_for_fronting_refusal(&self, status: u16, context: &str) {
+        if !self.h2_disabled.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "h2 returned HTTP {} for {} — likely :authority/SNI mismatch via \
+                 domain fronting. Disabling h2 fast path for this fronter and \
+                 falling back to http/1.1.",
+                status,
+                context,
+            );
+        }
+        *self.h2_cell.lock().await = None;
+        // Reclassify: undo the h2_calls increment from
+        // run_h2_relay_with_send and bill this attempt as a fallback.
+        // saturating_sub-style guard: only decrement if non-zero so a
+        // direct caller of this helper from a non-Ok path can't
+        // underflow the counter.
+        let _ = self.h2_calls.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |c| if c > 0 { Some(c - 1) } else { None },
+        );
+        self.h2_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Clear the h2 cell *only if* its generation matches the one the
+    /// caller observed. Prevents the race where:
+    ///   1. Task A holds SendRequest from generation N
+    ///   2. Generation N's connection dies; Task B reopens → cell now
+    ///      holds generation N+1 (healthy)
+    ///   3. Task A's stale stream errors → unconditionally clearing
+    ///      the cell would kill the healthy N+1
+    /// With generation matching, A's poison is a no-op against N+1.
+    async fn poison_h2_if_gen(&self, generation: u64) {
+        let mut cell = self.h2_cell.lock().await;
+        if let Some(c) = cell.as_ref() {
+            if c.generation == generation {
+                *cell = None;
+            }
+        }
+    }
+
+    /// Send one POST through the active h2 connection, follow up to 5
+    /// redirects, and return `(status, headers, body)` — the same shape
+    /// the h1 path's `read_http_response` produces, so callers can stay
+    /// transport-agnostic from this point on.
+    ///
+    /// `path` is the HTTP path including the leading slash. The Host /
+    /// :authority header is taken from `self.http_host` for the initial
+    /// request and from the `Location` URL on redirect. `payload` is the
+    /// body bytes; `content_type` is set when non-None (for the JSON
+    /// envelope). Empty body + None content_type → GET (used for redirect
+    /// follow-up).
+    /// Run one h2 stream and return `(status, headers, body)`. Errors
+    /// carry a `RequestSent` flag so the caller can distinguish "never
+    /// sent" (safe to retry on h1) from "may have been processed by
+    /// origin" (only safe to retry for idempotent methods).
+    ///
+    /// Two phases, two timeouts:
+    ///   * **Ready (back-pressure):** bounded by `H2_READY_TIMEOUT_SECS`
+    ///     (5 s constant). A stall here means the conn is saturated
+    ///     under `MAX_CONCURRENT_STREAMS` (or dead at the muxer level)
+    ///     but no stream has opened — `RequestSent::No`.
+    ///   * **Response (post-send):** bounded by the caller-provided
+    ///     `response_deadline`. After `send_request` returns Ok the
+    ///     headers are queued; we conservatively treat any later
+    ///     failure or timeout as `RequestSent::Maybe`. Caller picks
+    ///     the deadline so legitimate slow Apps Script calls and
+    ///     Full-mode batches with custom `request_timeout_secs` aren't
+    ///     cut off at an arbitrary fixed cap.
+    async fn h2_round_trip(
+        &self,
+        send: h2::client::SendRequest<Bytes>,
+        method: &str,
+        path: &str,
+        host: &str,
+        payload: Bytes,
+        content_type: Option<&str>,
+        response_deadline: Duration,
+    ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), (FronterError, RequestSent)> {
+        // h2 requires absolute-form URIs with the :authority pseudo-header
+        // populated from the Host. http::Request's URI parser accepts
+        // `https://{host}{path}` for that.
+        let uri = format!("https://{}{}", host, path);
+        let mut builder = http::Request::builder().method(method).uri(uri);
+        // Apps Script accepts gzip on the response; mirror the h1 path so
+        // payloads stay small.
+        builder = builder.header("accept-encoding", "gzip");
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        let req = builder.body(()).map_err(|e| {
+            (
+                FronterError::Relay(format!("h2 request build: {}", e)),
+                RequestSent::No,
+            )
+        })?;
+
+        // Phase 1: ready/back-pressure. Bounded short. Timeout here
+        // means saturation, not server-side processing — the stream
+        // hasn't even opened, so `RequestSent::No`.
+        let ready_result = tokio::time::timeout(
+            Duration::from_secs(H2_READY_TIMEOUT_SECS),
+            send.ready(),
+        )
+        .await;
+        let mut send = match ready_result {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                return Err((
+                    FronterError::Relay(format!("h2 ready: {}", e)),
+                    RequestSent::No,
+                ));
+            }
+            Err(_) => {
+                return Err((FronterError::Timeout, RequestSent::No));
+            }
+        };
+
+        let has_body = !payload.is_empty();
+        // send_request is synchronous; it queues the HEADERS frame.
+        // After this returns Ok we conservatively assume the request
+        // reached the server. An Err here means the stream couldn't
+        // be opened (e.g. connection-level GOAWAY), safe to retry.
+        let (response_fut, mut body_tx) = send.send_request(req, !has_body).map_err(|e| {
+            (
+                FronterError::Relay(format!("h2 send_request: {}", e)),
+                RequestSent::No,
+            )
+        })?;
+
+        if has_body {
+            // body_tx errors here are RequestSent::Maybe — headers were
+            // already queued, so we may have invoked Apps Script's doPost
+            // even if the body never finished.
+            body_tx.send_data(payload, true).map_err(|e| {
+                (
+                    FronterError::Relay(format!("h2 send_data: {}", e)),
+                    RequestSent::Maybe,
+                )
+            })?;
+        }
+
+        // Phase 2a: wait for response headers. Bounded by the caller's
+        // deadline (`batch_timeout` / `request_timeout_secs`). A timeout
+        // here means the relay never responded — safe to retry.
+        let header_phase = async {
+            let response = response_fut.await.map_err(|e| {
+                (
+                    FronterError::Relay(format!("h2 response: {}", e)),
+                    RequestSent::Maybe,
+                )
+            })?;
+            let (parts, body) = response.into_parts();
+            let status = parts.status.as_u16();
+
+            // Convert headers to the (String, String) Vec the rest of
+            // the codebase expects. Multi-valued headers (set-cookie,
+            // etc.) are expanded one entry per value, matching
+            // httparse's emission.
+            let mut headers: Vec<(String, String)> = Vec::with_capacity(parts.headers.len());
+            for (name, value) in parts.headers.iter() {
+                if let Ok(v) = value.to_str() {
+                    headers.push((name.as_str().to_string(), v.to_string()));
+                }
+            }
+            Ok::<_, (FronterError, RequestSent)>((status, headers, body))
+        };
+
+        let (status, headers, mut body) = match tokio::time::timeout(
+            response_deadline,
+            header_phase,
+        )
+        .await
+        {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err((FronterError::Timeout, RequestSent::Maybe)),
+        };
+
+        // Phase 2b: drain body. Each chunk is individually bounded by
+        // `stream_timeout` (default 300s) so large responses routed
+        // through Apps Script (where a 256 KB range chunk can take 30-90s
+        // of wall-clock time) are not killed by the tighter `batch_timeout`.
+        // Release flow-control credit per chunk so large responses don't
+        // stall after the initial window.
+        // Pre-size from content-length to avoid O(log n) realloc cycles
+        // on large GAS responses (up to 40 MB).
+        let stream_timeout = self.stream_timeout();
+        let body_hint: usize = headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0);
+        let mut buf: Vec<u8> = Vec::with_capacity(body_hint.min(APPS_SCRIPT_BODY_MAX_BYTES as usize));
+        loop {
+            match tokio::time::timeout(stream_timeout, body.data()).await {
+                Ok(None) => break,
+                Ok(Some(Ok(chunk))) => {
+                    let n = chunk.len();
+                    buf.extend_from_slice(&chunk);
+                    let _ = body.flow_control().release_capacity(n);
+                }
+                Ok(Some(Err(e))) => {
+                    return Err((
+                        FronterError::Relay(format!("h2 body chunk: {}", e)),
+                        RequestSent::Maybe,
+                    ));
+                }
+                Err(_) => return Err((FronterError::Timeout, RequestSent::Maybe)),
+            }
+        }
+
+        // Mirror `read_http_response`: if the server gzipped the body
+        // (we asked for it via accept-encoding), decompress before
+        // handing back so downstream JSON / envelope parsers see plain
+        // bytes regardless of transport.
+        if let Some(enc) = header_get(&headers, "content-encoding") {
+            if enc.eq_ignore_ascii_case("gzip") {
+                if let Ok(decoded) = decode_gzip(&buf) {
+                    buf = decoded;
+                }
+            }
+        }
+
+        Ok((status, headers, buf))
+    }
+
+    /// Run a full relay round-trip over h2: initial POST + up to 5
+    /// redirect hops. `path` is the Apps Script `/macros/s/{id}/exec`
+    /// path. Returns the same `(status, headers, body)` triple as the
+    /// h1 path on success.
+    ///
+    /// `response_deadline` bounds the post-send phase of each round
+    /// trip (response headers + body drain). The ready/back-pressure
+    /// phase has its own short bound (`H2_READY_TIMEOUT_SECS`).
+    /// Caller picks the deadline based on its own outer budget:
+    ///   * Apps-Script direct (`relay_uncoalesced`): a few seconds
+    ///     under `REQUEST_TIMEOUT_SECS` (25 s) so an h2 timeout still
+    ///     leaves room for an h1 fallback.
+    ///   * Full-mode tunnel (`tunnel_request` / `tunnel_batch_request_to`):
+    ///     `self.batch_timeout` so the user's
+    ///     `request_timeout_secs` setting actually applies.
+    ///
+    /// On error, the second tuple field is `RequestSent::No` if the
+    /// request never reached Apps Script (safe to retry on h1) or
+    /// `RequestSent::Maybe` if it may have been processed (replaying
+    /// risks duplicating side effects for non-idempotent methods).
+    /// `ensure_h2` returning None always reports `RequestSent::No`.
+    ///
+    /// Takes `payload` as `Bytes` so callers can clone (Arc bump,
+    /// not memcpy) when they want to retain a copy for h1 fallback.
+    async fn h2_relay_request(
+        &self,
+        path: &str,
+        payload: Bytes,
+        response_deadline: Duration,
+    ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), (FronterError, RequestSent)> {
+        let (send, generation) = match self.ensure_h2().await {
+            Some(s) => s,
+            None => {
+                // ensure_h2 returning None covers:
+                //   1. force_http1 / sticky-disabled — never tried h2
+                //      this call. NOT a fallback, don't count.
+                //   2. open_h2 just failed / timed out / backoff active.
+                //      We DID attempt h2 and lost it; count as fallback
+                //      so the stat reflects reality. `ensure_h2` itself
+                //      sets the backoff timestamp on failure.
+                if !self.h2_disabled.load(Ordering::Relaxed) {
+                    self.h2_fallbacks.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err((
+                    FronterError::Relay("h2 unavailable".into()),
+                    RequestSent::No,
+                ));
+            }
+        };
+
+        self.run_h2_relay_with_send(send, generation, path, payload, response_deadline)
+            .await
+    }
+
+    /// Inner h2 relay loop — split out so tests can inject a
+    /// `SendRequest` (from a local h2c test server) without going
+    /// through `ensure_h2`'s real-network handshake.
+    ///
+    /// Each h2_round_trip uses its own internal phase-split timeouts
+    /// (ready=5s constant, response=`response_deadline`). No outer
+    /// wrap is needed here — the inner timeouts are what poisons the
+    /// cell on stall.
+    async fn run_h2_relay_with_send(
+        &self,
+        send: h2::client::SendRequest<Bytes>,
+        generation: u64,
+        path: &str,
+        payload: Bytes,
+        response_deadline: Duration,
+    ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), (FronterError, RequestSent)> {
+        let mut current_host = self.http_host.to_string();
+        let mut current_path = path.to_string();
+
+        let res = self
+            .h2_round_trip(
+                send.clone(),
+                "POST",
+                &current_path,
+                &current_host,
+                payload,
+                Some("application/json"),
+                response_deadline,
+            )
+            .await;
+        let (mut status, mut hdrs, mut body) = match res {
+            Ok(t) => t,
+            Err((e, sent)) => {
+                self.poison_h2_if_gen(generation).await;
+                self.h2_fallbacks.fetch_add(1, Ordering::Relaxed);
+                return Err((e, sent));
+            }
+        };
+
+        // The initial POST already succeeded — the request reached
+        // Apps Script. From here on, redirect-follow failures are
+        // RequestSent::Maybe regardless of where they land in the
+        // chain, because the *original* Apps Script call may have
+        // already executed.
+        for _ in 0..5 {
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                break;
+            }
+            let Some(loc) = header_get(&hdrs, "location") else {
+                break;
+            };
+            let (rpath, rhost) = parse_redirect(&loc);
+            current_host = rhost.unwrap_or(current_host);
+            current_path = rpath;
+            let res = self
+                .h2_round_trip(
+                    send.clone(),
+                    "GET",
+                    &current_path,
+                    &current_host,
+                    Bytes::new(),
+                    None,
+                    response_deadline,
+                )
+                .await;
+            match res {
+                Ok((s, h, b)) => {
+                    status = s;
+                    hdrs = h;
+                    body = b;
+                }
+                Err((e, _)) => {
+                    self.poison_h2_if_gen(generation).await;
+                    self.h2_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    return Err((e, RequestSent::Maybe));
+                }
+            }
+        }
+
+        self.h2_calls.fetch_add(1, Ordering::Relaxed);
+        Ok((status, hdrs, body))
+    }
+
+    /// Relay an HTTP request through Apps Script.
+    /// Returns a raw HTTP/1.1 response (status line + headers + body) suitable
+    /// for writing back to the browser over an MITM'd TLS stream.
+    pub async fn relay(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        self.quota_tracker.record_relay();
+
+        // Block ALL relay paths (exit node + Apps Script) when every account
+        // bucket is quota-exhausted. Checked here so the exit node short-circuit
+        // below can't bypass the global hard stop.
+        if self.quota_tracker.is_globally_hard_stopped() {
+            self.relay_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                "[quota] global hard stop active — all Apps Script account buckets exhausted"
+            );
+            return error_response(
+                503,
+                "All Apps Script accounts quota exhausted; hard stop active. \
+                 Quota resets on a rolling 24-hour window per account.",
+            );
+        }
+
+        // Optional URL rewrite for X/Twitter GraphQL (issue #16). Applied
+        // here, at the top of relay(), so it affects BOTH the cache key
+        // (so matching requests collapse into one entry) AND the URL that
+        // gets sent upstream to Apps Script (so Apps Script only has to
+        // fetch the trimmed variant, cutting quota usage).
+        let normalized;
+        let url: &str = if self.normalize_x_graphql {
+            normalized = normalize_x_graphql_url(url);
+            normalized.as_str()
+        } else {
+            url
+        };
+
+        // Exit-node short-circuit: route through the configured second-hop
+        // relay (Deno Deploy / fly.io / etc.) for hosts that need a
+        // non-Google exit IP. The cache + coalesce layer below is bypassed
+        // for these — exit-node-eligible hosts are the ones with active
+        // anti-bot challenges (CF Turnstile, ChatGPT login, Claude.ai,
+        // grok.com), and serving cached responses across users for those
+        // would be wrong (auth tokens, session state, per-user
+        // personalization). Falls back to the regular Apps Script relay
+        // if the exit node fails (network error, 5xx from the exit node, etc.)
+        // so a misconfigured or down exit node doesn't take the user
+        // offline for the sites that DON'T need it.
+        if self.exit_node_matches(url) {
+            let t0 = Instant::now();
+            match self.relay_via_exit_node(method, url, headers, body).await {
+                Ok(bytes) => {
+                    self.record_site(
+                        url,
+                        false,
+                        bytes.len() as u64,
+                        t0.elapsed().as_nanos() as u64,
+                    );
+                    self.bytes_relayed.fetch_add(
+                        (body.len() + bytes.len()) as u64,
+                        Ordering::Relaxed,
+                    );
+                    return bytes;
+                }
+                Err(e) if !e.is_retryable() => {
+                    // The NonRetryable guard exists to prevent duplicate
+                    // side-effects on POST/PUT/PATCH/DELETE: if the h2
+                    // outer call reached Apps Script and timed out, the
+                    // inner request may have already been executed by the
+                    // exit node. Falling through would re-send it.
+                    //
+                    // For idempotent methods (GET/HEAD/OPTIONS) there are
+                    // no side-effects, so re-sending via direct Apps Script
+                    // is always safe. Range downloads are GET — if a script
+                    // ID hits its 6-minute cap and times out, falling back
+                    // to direct Apps Script (round-robining to a fresh ID)
+                    // is the correct behaviour rather than returning 502.
+                    if is_method_safe_for_fanout(method) {
+                        tracing::warn!(
+                            "exit node non-retryable timeout for {} {} — method is idempotent, falling back to direct Apps Script",
+                            method, url,
+                        );
+                        // fall through to the regular relay path below
+                    } else {
+                        tracing::warn!(
+                            "exit node failed for {} {} and request was already sent ({}); not falling back to direct Apps Script",
+                            method, url, e,
+                        );
+                        self.relay_failures.fetch_add(1, Ordering::Relaxed);
+                        let inner = e.into_inner();
+                        self.record_site(url, false, 0, t0.elapsed().as_nanos() as u64);
+                        return error_response(502, &format!("Relay error: {}", inner));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "exit node failed for {}: {} — falling back to direct Apps Script",
+                        url,
+                        e
+                    );
+                    // fall through to the regular relay path below
+                }
+            }
+        }
+
+        // Range requests are partial-content responses; caching or
+        // coalescing them against a non-range key would be catastrophic
+        // (wrong bytes for the wrong consumer). The range-parallel
+        // downloader calls `relay()` concurrently with N different Range
+        // headers for the same URL, and absolutely needs each call to go
+        // to the relay independently. Simplest correct answer: if any
+        // Range header is present, skip cache and coalesce entirely.
+        let has_range = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
+        let coalescible = is_cacheable_method(method) && body.is_empty() && !has_range;
+        let key = if coalescible { Some(cache_key(method, url)) } else { None };
+        let t_start = Instant::now();
+
+        if let Some(ref k) = key {
+            if let Some(hit) = self.cache.get(k) {
+                tracing::debug!("cache hit: {}", url);
+                self.record_site(url, true, hit.len() as u64, t_start.elapsed().as_nanos() as u64);
+                return hit;
+            }
+        }
+
+        // Coalesce concurrent identical requests: only the first caller actually
+        // hits the relay; waiters subscribe to the same broadcast channel.
+        let waiter = if let Some(ref k) = key {
+            let mut inflight = self.inflight.lock().await;
+            match inflight.get(k) {
+                Some(tx) => {
+                    let rx = tx.subscribe();
+                    self.coalesced.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!("coalesced: {}", url);
+                    Some(rx)
+                }
+                None => {
+                    let (tx, _) = broadcast::channel(1);
+                    inflight.insert(k.clone(), tx);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(mut rx) = waiter {
+            match rx.recv().await {
+                Ok(bytes) => return bytes,
+                Err(_) => return error_response(502, "coalesced request dropped"),
+            }
+        }
+
+        let bytes = self.relay_uncoalesced(method, url, headers, body, key.as_deref()).await;
+
+        if let Some(ref k) = key {
+            let mut inflight = self.inflight.lock().await;
+            if let Some(tx) = inflight.remove(k) {
+                let _ = tx.send(bytes.clone());
+            }
+        }
+
+        self.record_site(url, false, bytes.len() as u64, t_start.elapsed().as_nanos() as u64);
+        bytes
+    }
+
+    /// Range-parallel relay — the big difference between this port and
+    /// the upstream Python version. Apps Script's per-call cost is
+    /// ~flat (1-2s regardless of payload), so a 10MB single GET is
+    /// ~10s round-trip; the same 10MB sliced into 40 x 256KB chunks
+    /// and fetched 16-at-a-time is 3-4 round-trips, total ~6-8s, and
+    /// the client sees the first byte in 1-2s instead of 10. This is
+    /// what actually makes YouTube video playback viable through the
+    /// relay — without it, googlevideo.com chunks timeout or stall
+    /// while the player waits for the next 10s-away Apps Script call
+    /// to finish.
+    ///
+    /// Flow (mirrors upstream `relay_parallel`):
+    ///   1. For anything other than GET-without-body, defer to
+    ///      `relay()` — range requests on POSTs / PUTs aren't well
+    ///      defined, and the user-sent-Range-header case is handled
+    ///      by relay() already (we skip cache for it).
+    ///   2. Probe with `Range: bytes=0-<chunk-1>`.
+    ///   3. 200 back (origin doesn't support ranges) → write as-is.
+    ///   4. 206 back → parse Content-Range total. If Content-Range says
+    ///      the entity fits in the first probe, rewrite the 206 to a 200
+    ///      so the client — which never asked for a
+    ///      range — doesn't choke on a stray Partial Content. (x.com
+    ///      and Cloudflare turnstile in particular reject unsolicited
+    ///      206 on XHR/fetch.)
+    ///   5. Else: compute the remaining ranges, fetch them with
+    ///      bounded concurrency. Two output modes:
+    ///        * `total ≤ APPS_SCRIPT_BODY_MAX_BYTES` (buffered): stitch
+    ///          all chunks into one `Vec<u8>`, transform the response
+    ///          head, write to caller in one shot. On chunk failure,
+    ///          fall back to a single GET — Apps Script can deliver
+    ///          the file in one piece up to its ~40 MiB cap. Safety
+    ///          net intact.
+    ///        * `total > APPS_SCRIPT_BODY_MAX_BYTES` (streaming): write
+    ///          the response head with `Content-Length: total` and the
+    ///          probe body straight to the client, then stream each
+    ///          remaining chunk to the client as it arrives in order.
+    ///          No buffered fallback (we've already committed bytes on
+    ///          the wire), but single-GET fallback wouldn't fit through
+    ///          Apps Script for files this size anyway — streaming with
+    ///          truncation on hard chunk failure beats today's 25s
+    ///          timeout + 504 (#1042).
+    ///
+    /// `transform_head` lets the caller rewrite the response head block
+    /// (e.g. CORS injection) without coupling this module to the
+    /// caller's policy. The input is the head bytes from "HTTP/1.x …"
+    /// through the trailing `\r\n\r\n`; the output should be the same
+    /// shape. Pass an identity closure if no rewrite is needed.
+    pub async fn relay_parallel_range_to<W, F>(
+        &self,
+        writer: &mut W,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        transform_head: F,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        F: Fn(&[u8]) -> Vec<u8>,
+    {
+        self.do_relay_parallel_range_to(
+            writer,
+            method,
+            url,
+            headers,
+            body,
+            &transform_head,
+            /*streaming_allowed=*/ true,
+        )
+        .await
+    }
+
+    /// Shared dispatch for [`Self::relay_parallel_range_to`] (streaming
+    /// enabled) and [`Self::relay_parallel_range`] (the `Vec<u8>`
+    /// compatibility wrapper, streaming disabled).
+    ///
+    /// When `streaming_allowed=false`, the function refuses the
+    /// streaming branch even when the response is large enough to
+    /// warrant it — instead falling back to a plain `self.relay()`
+    /// single GET, matching the pre-1.9.23 wrapper contract that a
+    /// `Vec<u8>` return must never be a fake-200 with the
+    /// `Content-Length` of the full advertised total but only a
+    /// prefix of the body (Issue #162). The streaming branch can
+    /// commit head + partial body before discovering a chunk
+    /// failure; that's correct for a wire writer (download client
+    /// sees Content-Length mismatch, retries via Range from the
+    /// partial position) but a buffered `Vec<u8>` consumer has no
+    /// way to react to the truncation, so we keep them off that
+    /// path entirely.
+    #[allow(clippy::too_many_arguments)]
+    async fn do_relay_parallel_range_to<W, F>(
+        &self,
+        writer: &mut W,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        transform_head: &F,
+        streaming_allowed: bool,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        F: Fn(&[u8]) -> Vec<u8>,
+    {
+        const MAX_PARALLEL: usize = 16;
+        let chunk = RANGE_PARALLEL_CHUNK_BYTES;
+
+        if method != "GET" || !body.is_empty() {
+            let raw = self.relay(method, url, headers, body).await;
+            return write_response_with_head_transform(writer, &raw, &transform_head).await;
+        }
+        // If the client already sent a Range header, inspect it:
+        //
+        // • bytes=N- or bytes=N-M with N>0 (resume / mid-file seek): route
+        //   through the parallel chunk path starting at offset N. Passing the
+        //   raw header to relay() would ask Apps Script to return everything
+        //   from byte N to EOF in one call — for a 3 GiB file that's well
+        //   over Apps Script's 50 MiB response cap, guaranteed 504 every try.
+        //
+        // • bytes=0-M (small specific range from the start): pass through
+        //   to relay() as-is. On relay failure close cleanly so the client
+        //   retries with its Range intact rather than restarting from byte 0.
+        if let Some(range_val) = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+            .map(|(_, v)| v.clone())
+        {
+            if let Some(start) = parse_range_start(&range_val).filter(|&s| s > 0) {
+                tracing::debug!(
+                    "range-parallel-resume: client Range {} for {}; probing from offset {}",
+                    range_val, url, start,
+                );
+                return self
+                    .stream_range_from_offset(
+                        writer,
+                        method,
+                        url,
+                        headers,
+                        body,
+                        start,
+                        chunk,
+                        transform_head,
+                    )
+                    .await;
+            }
+            // start == 0 or unparseable — honour as-is with clean-close on failure.
+            let raw = self.relay(method, url, headers, body).await;
+            let status = split_response(&raw).map(|(s, _, _)| s).unwrap_or(0);
+            if status >= 400 || status == 0 {
+                tracing::warn!(
+                    "range relay returned status {} for request {}; closing cleanly so client retries with Range",
+                    status, url,
+                );
+                return Err(std::io::Error::other(format!(
+                    "range relay status {} — closing for clean resume",
+                    status
+                )));
+            }
+            return write_response_with_head_transform(writer, &raw, &transform_head).await;
+        }
+
+        // Probe with the first chunk.
+        let mut probe_headers: Vec<(String, String)> = headers.to_vec();
+        probe_headers.push(("Range".into(), format!("bytes=0-{}", chunk - 1)));
+        let first = self.relay(method, url, &probe_headers, body).await;
+
+        let (status, resp_headers, resp_body) = match split_response(&first) {
+            Some(v) => v,
+            None => {
+                return write_response_with_head_transform(writer, &first, &transform_head).await
+            }
+        };
+
+        if status != 206 {
+            // Origin returned the whole thing (or an error). Either way,
+            // pass through.
+            return write_response_with_head_transform(writer, &first, &transform_head).await;
+        }
+
+        let probe_range = match validate_probe_range(status, &resp_headers, resp_body, chunk - 1)
+        {
+            Some(r) => r,
+            None => {
+                tracing::warn!(
+                    "range-parallel: probe returned invalid 206 for {}; falling back to single GET",
+                    url,
+                );
+                let raw = self.relay(method, url, headers, body).await;
+                return write_response_with_head_transform(writer, &raw, &transform_head).await;
+            }
+        };
+        let total = probe_range.total;
+
+        if total <= chunk || (probe_range.end + 1) >= total {
+            let raw = rewrite_206_to_200(&first);
+            return write_response_with_head_transform(writer, &raw, &transform_head).await;
+        }
+
+        // Range planning is lazy via `plan_remaining_ranges` — a hostile
+        // origin can advertise `Content-Range: bytes 0-262143/<huge>` and
+        // pass the probe checks (matching 256 KiB body, claimed total >
+        // probe end), so eagerly building a `Vec<(u64, u64)>` for the
+        // full plan would let it drive arbitrary allocations on the
+        // stream branch (a 100 TiB advertised total at 256 KiB chunks
+        // is ~400M tuples, ~6 GB). PR #151's original `MAX_STITCHED_…`
+        // guard prevented this on the buffered side; lazy iteration
+        // preserves that protection for streaming without imposing a
+        // hard ceiling on legitimate large downloads.
+        let probe_end = probe_range.end;
+        let expected_chunks = (total - probe_end - 1).div_ceil(chunk);
+
+        // Branch: buffered stitch (fallback-safe) vs. streaming vs.
+        // single-GET fallback for the compat wrapper. See
+        // `dispatch_range_response` doc for the per-caller contract.
+        match dispatch_range_response(total, streaming_allowed) {
+            RangeDispatch::Stream => {
+                tracing::info!(
+                    "range-parallel-stream: {} bytes total, {} chunks after probe, up to {} in flight",
+                    total, expected_chunks, MAX_PARALLEL,
+                );
+                let fetches = self.fetch_chunks_stream(
+                    url,
+                    headers,
+                    plan_remaining_ranges(probe_end, total, chunk),
+                    total,
+                    MAX_PARALLEL,
+                );
+                return stream_range_response_to(
+                    writer,
+                    &resp_headers,
+                    resp_body,
+                    total,
+                    fetches,
+                    transform_head,
+                    url,
+                )
+                .await;
+            }
+            RangeDispatch::FallbackSingleGet => {
+                // `Vec<u8>` wrapper above 64 MiB: stream branch is
+                // off-limits (truncate-then-Err can't be reacted to),
+                // so we fall back to a single GET — same path the
+                // pre-1.9.23 wrapper took above its 64 MiB cap. Apps
+                // Script will typically return 502/504 because the
+                // response exceeds its delivery ceiling, but that's
+                // the contract: callers see Apps Script's error, not
+                // a half-written success.
+                tracing::info!(
+                    "range-parallel: {} bytes total > {} buffered cap and streaming disallowed; falling back to single GET",
+                    total, BUFFERED_STITCH_MAX_BYTES,
+                );
+                let raw = self.relay(method, url, headers, body).await;
+                return write_response_with_head_transform(writer, &raw, transform_head).await;
+            }
+            RangeDispatch::RejectTooLarge => {
+                // Quota-DoS guard: refuse the response. Streaming
+                // an advertised 16 GiB+ total would issue ~65 k
+                // chunk Apps Script calls (~daily quota on the free
+                // tier) per pwned URL — see `MAX_STREAMED_RANGE_BYTES`.
+                // 502 is the right status: this is upstream-induced
+                // refusal, not a client error.
+                tracing::warn!(
+                    "range-parallel: refusing {} bytes total for {} — exceeds {} streaming cap",
+                    total, url, MAX_STREAMED_RANGE_BYTES,
+                );
+                let raw = error_response(
+                    502,
+                    "Advertised Content-Range total exceeds relay's streaming \
+                     ceiling. The origin reported a size larger than the relay \
+                     is willing to fetch through Apps Script; refusing to spend \
+                     daily quota on a likely-hostile or buggy origin.",
+                );
+                return write_response_with_head_transform(writer, &raw, transform_head).await;
+            }
+            RangeDispatch::Buffered => {
+                // Fall through to the buffered stitch code below.
+            }
+        }
+
+        tracing::info!(
+            "range-parallel: {} bytes total, {} chunks remaining after probe, up to {} in flight",
+            total, expected_chunks, MAX_PARALLEL,
+        );
+
+        // Buffered stitch. `total` is bounded above by
+        // `BUFFERED_STITCH_MAX_BYTES` (64 MiB) for the `Vec<u8>`
+        // wrapper path and by `APPS_SCRIPT_BODY_MAX_BYTES` (40 MiB)
+        // for the writer-based API — see `dispatch_range_response`.
+        // Either way, well inside `usize` even on 32-bit targets, and
+        // the lazy range iterator produces at most ~256 tuples for a
+        // 64 MiB total at 256 KiB chunks, so collecting results into
+        // `Vec<_>` for stitching is cheap.
+        let total_usize = total as usize;
+
+        // Concurrent fetch with `buffered` — preserves input order
+        // (important for stitching) and caps in-flight count. Each task
+        // calls back into `relay()`, which already has retry + fan-out
+        // wiring on single-request granularity; we don't duplicate
+        // those here.
+        use futures_util::stream::StreamExt;
+        let fetches = self
+            .fetch_chunks_stream(
+                url,
+                headers,
+                plan_remaining_ranges(probe_end, total, chunk),
+                total,
+                MAX_PARALLEL,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        // Stitch: probe body first, then the chunks in order.
+        let mut full = Vec::with_capacity(total_usize);
+        full.extend_from_slice(resp_body);
+        for (start, end, chunk) in fetches {
+            match chunk {
+                Ok(chunk) => full.extend_from_slice(&chunk),
+                Err(reason) => {
+                    // Issue #162: silently rewriting the probe to a 200
+                    // here truncates the response to whatever the probe
+                    // saw (typically 256 KiB — the chunk size). Browsers
+                    // see HTTP 200 + Content-Length=262144 and treat
+                    // the download as complete; users reported "every
+                    // file capped at 256 KB" because every download
+                    // that hit this failure path landed there. Common
+                    // triggers: Apps Script stripping Content-Range,
+                    // origin returning 200-instead-of-206 on later
+                    // chunks, total mismatch across chunks. Correct
+                    // recovery is a fresh single GET — Apps Script
+                    // fetches the full URL up to its ~40 MiB cap. Slow
+                    // for big files vs. the parallel path but produces
+                    // a complete response, which is what matters.
+                    tracing::warn!(
+                        "range-parallel: invalid chunk {}-{} for {} ({}); falling back to single GET",
+                        start, end, url, reason,
+                    );
+                    let raw = self.relay(method, url, headers, body).await;
+                    return write_response_with_head_transform(writer, &raw, &transform_head)
+                        .await;
+                }
+            }
+        }
+
+        if (full.len() as u64) != total {
+            // Same fallback rationale as the chunk-validation case
+            // above: returning the probe truncates to 256 KiB. Single
+            // GET is the only way to give the user a complete file
+            // when the parallel stitch can't be trusted.
+            tracing::warn!(
+                "range-parallel: stitched {}/{} bytes for {}; falling back to single GET",
+                full.len(), total, url,
+            );
+            let raw = self.relay(method, url, headers, body).await;
+            return write_response_with_head_transform(writer, &raw, &transform_head).await;
+        }
+
+        // Build a 200 OK with Content-Length = full body length. Drop
+        // the Content-Range header (no longer applicable) and
+        // Transfer-Encoding/Content-Encoding (origin already decoded
+        // what we got; we ship plain bytes).
+        let raw = assemble_full_200(&resp_headers, &full);
+        write_response_with_head_transform(writer, &raw, &transform_head).await
+    }
+
+    /// Resume a large download from a byte offset by probing at
+    /// `[start, start+chunk-1]` and streaming the remaining chunks in
+    /// parallel — exactly like the initial download path but starting
+    /// mid-file. Called when the client sends `Range: bytes=N-` with
+    /// N > 0 (wget `-c`, browser resume). Responds with `206 Partial
+    /// Content` so the client appends to its existing partial file.
+    async fn stream_range_from_offset<W, F>(
+        &self,
+        writer: &mut W,
+        method: &str,
+        url: &str,
+        client_headers: &[(String, String)],
+        body: &[u8],
+        start: u64,
+        chunk: u64,
+        transform_head: &F,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        F: Fn(&[u8]) -> Vec<u8>,
+    {
+        const MAX_PARALLEL: usize = 16;
+
+        // Strip client's Range header; add our probe range [start, start+chunk-1].
+        let mut probe_headers: Vec<(String, String)> = client_headers
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("range"))
+            .cloned()
+            .collect();
+        probe_headers.push((
+            "Range".into(),
+            format!("bytes={}-{}", start, start + chunk - 1),
+        ));
+
+        let first = self.relay(method, url, &probe_headers, body).await;
+        let (status, resp_headers, resp_body) = match split_response(&first) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    "range-parallel-resume: malformed probe response for {}; closing cleanly",
+                    url
+                );
+                return Err(std::io::Error::other(
+                    "range-parallel-resume: malformed probe — closing for clean resume",
+                ));
+            }
+        };
+
+        if status != 206 {
+            if status >= 400 {
+                tracing::warn!(
+                    "range-parallel-resume: probe returned {} for {}; closing cleanly",
+                    status, url,
+                );
+                return Err(std::io::Error::other(format!(
+                    "range-parallel-resume: probe status {} — closing for clean resume",
+                    status,
+                )));
+            }
+            // Non-206 success (origin sent 200 for the full body) — forward as-is.
+            return write_response_with_head_transform(writer, &first, transform_head).await;
+        }
+
+        let probe_range =
+            match validate_probe_range_at_offset(status, &resp_headers, resp_body, start, start + chunk - 1)
+            {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(
+                        "range-parallel-resume: invalid 206 for {}; closing cleanly",
+                        url,
+                    );
+                    return Err(std::io::Error::other(
+                        "range-parallel-resume: invalid 206 — closing for clean resume",
+                    ));
+                }
+            };
+        let total = probe_range.total;
+
+        // Probe covered the rest of the file — forward this 206 as-is.
+        if (probe_range.end + 1) >= total {
+            return write_response_with_head_transform(writer, &first, transform_head).await;
+        }
+
+        let probe_end = probe_range.end;
+        let body_total = total - start;
+        let expected_chunks = (total - probe_end - 1).div_ceil(chunk);
+        tracing::info!(
+            "range-parallel-resume: {} total, resuming from byte {}, {} more chunks after probe, up to {} in flight for {}",
+            total, start, expected_chunks, MAX_PARALLEL, url,
+        );
+
+        // base_headers for fetch_chunks_stream must not include Range
+        // (fetch_chunks_stream adds its own per-chunk Range header).
+        let base_headers: Vec<(String, String)> = client_headers
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("range"))
+            .cloned()
+            .collect();
+
+        let fetches = self.fetch_chunks_stream(
+            url,
+            &base_headers,
+            plan_remaining_ranges(probe_end, total, chunk),
+            total,
+            MAX_PARALLEL,
+        );
+
+        let head = assemble_206_head(&resp_headers, start, total);
+        let head = transform_head(&head);
+        stream_chunks_to_writer(writer, &head, resp_body, body_total, fetches, url).await
+    }
+
+    /// Backward-compatible wrapper around `relay_parallel_range_to`
+    /// that buffers the full response into a `Vec<u8>` before
+    /// returning. Retained so downstream callers (and external
+    /// consumers of `mhrv-rs` as a library) that depend on the pre-
+    /// 1.9.23 `-> Vec<u8>` signature keep working without code
+    /// changes. New code should prefer `relay_parallel_range_to`,
+    /// which streams large files chunk-by-chunk instead of buffering
+    /// the response in memory.
+    ///
+    /// **Pre-1.9.23 contract preservation:** for responses above the
+    /// buffered ceiling (`BUFFERED_STITCH_MAX_BYTES`, 64 MiB) the
+    /// wrapper deliberately falls back to a single `relay()` call
+    /// rather than taking the streaming branch. Streaming commits a
+    /// `200 OK` head with `Content-Length: <total>` plus a partial
+    /// body before discovering chunk failures — that's correct for a
+    /// wire writer (download client retries via Range) but exactly
+    /// the "fake-truncated-success" contract violation from Issue
+    /// #162 once the bytes are collected into a buffer the caller
+    /// can't react to. Wrapper callers therefore see the same upper
+    /// bound on response size and the same fallback semantics they
+    /// had before 1.9.23; only the failure surface changes (502/504
+    /// from Apps Script for the >40 MiB case, same as before).
+    pub async fn relay_parallel_range(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let identity = |head: &[u8]| head.to_vec();
+        // Writing to a `Vec<u8>` through `VecAsyncWriter` never fails
+        // (no I/O), so the `io::Result` from the writer-based API is
+        // always `Ok` here — modulo the streaming branch's chunk-
+        // validation error path. Disabling streaming
+        // (`streaming_allowed=false`) keeps the wrapper off that
+        // path, so the only `Err` cases left are unreachable for
+        // `VecAsyncWriter`.
+        let _ = self
+            .do_relay_parallel_range_to(
+                &mut VecAsyncWriter(&mut buf),
+                method,
+                url,
+                headers,
+                body,
+                &identity,
+                /*streaming_allowed=*/ false,
+            )
+            .await;
+        buf
+    }
+
+    /// Build the concurrent fetch stream used by both the buffered and
+    /// streaming branches of `relay_parallel_range_to`. Each yielded
+    /// item is `(start, end, Result<chunk_body, validation_reason>)`
+    /// in input order (via `buffered`, which preserves order while
+    /// capping in-flight count). Splitting this out keeps the
+    /// branching at the call site small and lets tests for the
+    /// streaming writer use a synthetic `Stream` with no
+    /// `DomainFronter` dependency.
+    fn fetch_chunks_stream<'a, I>(
+        &'a self,
+        url: &str,
+        base_headers: &[(String, String)],
+        ranges: I,
+        total: u64,
+        max_parallel: usize,
+    ) -> impl futures_util::Stream<Item = (u64, u64, Result<Vec<u8>, &'static str>)> + 'a
+    where
+        I: IntoIterator<Item = (u64, u64)> + 'a,
+        I::IntoIter: 'a,
+    {
+        use futures_util::stream::{self, StreamExt};
+        let url_owned = url.to_string();
+        let base_h = base_headers.to_vec();
+        stream::iter(ranges)
+            .map(move |(s, e)| {
+                let url = url_owned.clone();
+                let mut h = base_h.clone();
+                // Force a single Range header — if the caller's headers
+                // somehow already had one we wouldn't be here, but be
+                // defensive anyway.
+                h.retain(|(k, _)| !k.eq_ignore_ascii_case("range"));
+                h.push(("Range".into(), format!("bytes={}-{}", s, e)));
+                async move {
+                    let raw = self.relay("GET", &url, &h, &[]).await;
+                    (s, e, extract_exact_range_body(&raw, s, e, total))
+                }
+            })
+            .buffered(max_parallel)
+    }
+
+    async fn relay_uncoalesced(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        cache_key_opt: Option<&str>,
+    ) -> Vec<u8> {
+        self.relay_calls.fetch_add(1, Ordering::Relaxed);
+        let bytes = match timeout(
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            self.do_relay_with_retry(method, url, headers, body),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => {
+                self.relay_failures.fetch_add(1, Ordering::Relaxed);
+                self.log_relay_failure(&e);
+                return error_response(502, &format!("Relay error: {}", e));
+            }
+            Err(_) => {
+                // Timeout here means Apps Script didn't respond within
+                // REQUEST_TIMEOUT_SECS (currently 25). The most common
+                // cause by far is the account's daily UrlFetchApp quota
+                // being exhausted — once Google kills the script mid-exec,
+                // our relay hangs until timeout because no body ever comes
+                // back. Surface that possibility in the message instead
+                // of just "timeout", which has burned several users asking
+                // "why did it work yesterday" (see issues #99, #111, #105).
+                self.relay_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::error!("Relay timeout — Apps Script unresponsive");
+                return error_response(
+                    504,
+                    "Relay timeout — Apps Script did not respond. \
+                     Most likely cause: daily UrlFetchApp quota exhausted \
+                     (resets 00:00 UTC). Other possibilities: script.google.com \
+                     unreachable from your network, or the Apps Script edge is having issues. \
+                     Check the script's Executions tab at script.google.com for the real error.",
+                );
+            }
+        };
+        self.bytes_relayed.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        // Daily-budget counters (reset at 00:00 UTC). Only counts
+        // successful relays — the two error branches above don't reach
+        // here, matching what Google actually billed to quota.
+        self.record_today(bytes.len() as u64);
+
+        if let Some(k) = cache_key_opt {
+            if let Some(ttl) = parse_ttl(&bytes, url) {
+                tracing::debug!("cache store: {} ttl={}s", url, ttl.as_secs());
+                self.cache.put(k.to_string(), bytes.clone(), ttl);
+            }
+        }
+        bytes
+    }
+
+    async fn do_relay_with_retry(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<Vec<u8>, FronterError> {
+        // Refuse immediately if every configured account bucket is exhausted.
+        // Conservative: only triggers when all buckets are hard-stopped OR the
+        // aggregate remaining quota has crossed the collective safety threshold
+        // with confirmed quota error evidence (not random network failures).
+        if self.quota_tracker.is_globally_hard_stopped() {
+            tracing::error!(
+                "[quota] global hard stop active — all Apps Script account buckets exhausted"
+            );
+            return Err(FronterError::Relay(
+                "All Apps Script accounts quota exhausted; hard stop active. \
+                 Quota resets on a rolling 24-hour window per account."
+                    .into(),
+            ));
+        }
+
+        // Fan-out path: fire N instances in parallel, return first Ok, cancel
+        // the rest. Clamps to number of available script IDs so the single-ID
+        // case is a no-op even if parallel_relay>1 was configured.
+        //
+        // `select_ok` cancels the loser futures, but those futures only own
+        // the OUR-side I/O (TLS write, response read) — the Apps Script
+        // server has no idea the racing Rust task is gone, so every fan-out
+        // call still completes server-side and Apps Script's
+        // `UrlFetchApp.fetch()` to the destination still fires. For
+        // **non-idempotent** methods (POST / PUT / PATCH / DELETE) this
+        // surfaces as duplicate writes at the destination — a comment
+        // posted twice, a vote double-counted, a payment double-charged.
+        //
+        // Reported in #743: parallel_relay=2 + a POST to GitHub created
+        // two issue comments per submission. Same root cause as the
+        // SAFE_REPLAY_METHODS guard in Code.gs's `_doBatch` fallback —
+        // safe methods are idempotent, so re-firing is at worst wasteful;
+        // unsafe methods can have side effects, so re-firing is incorrect.
+        //
+        // Drop to sequential for non-idempotent methods regardless of
+        // `parallel_relay` setting. Users keep p95 wins on browsing /
+        // GET-heavy traffic (the common case) and don't lose correctness
+        // on form submits.
+        let method_safe_for_fanout = is_method_safe_for_fanout(method);
+        let fan = self.parallel_relay.min(self.script_ids.len()).max(1);
+        if fan >= 2 && method_safe_for_fanout {
+            return self.do_relay_parallel(method, url, headers, body, fan).await;
+        }
+
+        // Sequential path: one retry on connection failure, *unless*
+        // the failure is `FronterError::NonRetryable` — that wrapper
+        // says "the request may have already reached the server, do
+        // not duplicate." Without this guard, an h2 post-send failure
+        // on a non-idempotent method (POST/PUT/PATCH/DELETE) that the
+        // h2 layer correctly refused to replay on h1 would be
+        // re-issued here anyway, defeating the safety policy.
+        match self.do_relay_once(method, url, headers, body).await {
+            Ok(v) => Ok(v),
+            Err(e) if !e.is_retryable() => {
+                tracing::warn!(
+                    "relay attempt 1 failed and is non-retryable ({}); not duplicating {} {}",
+                    e,
+                    method,
+                    url,
+                );
+                Err(e.into_inner())
+            }
+            Err(e) => {
+                tracing::debug!("relay attempt 1 failed: {}; retrying", e);
+                self.do_relay_once(method, url, headers, body).await
+            }
+        }
+    }
+
+    async fn do_relay_parallel(
+        self: &Self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        fan: usize,
+    ) -> Result<Vec<u8>, FronterError> {
+        use futures_util::future::FutureExt;
+        let ids = self.next_script_ids(fan);
+        if ids.is_empty() {
+            return Err(FronterError::Relay("no script_ids available".into()));
+        }
+
+        // Build one future per script, each a pinned boxed future so we can
+        // `select_ok` over them.
+        let mut futs = Vec::with_capacity(ids.len());
+        for sid in ids {
+            let fut = self.do_relay_once_with(sid.clone(), method, url, headers, body).boxed();
+            futs.push(fut);
+        }
+
+        // `select_ok`: drive all futures concurrently, return the first Ok
+        // (cancelling the rest when the returned future is dropped). If all
+        // error out, returns the last error.
+        match futures_util::future::select_ok(futs).await {
+            Ok((bytes, _remaining)) => Ok(bytes),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn do_relay_once(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<Vec<u8>, FronterError> {
+        let script_id = self.next_script_id();
+        self.do_relay_once_with(script_id, method, url, headers, body).await
+    }
+
+    /// Quota-recording wrapper around `do_relay_once_inner`. Counts every
+    /// Apps Script fetch attempt (including retries) against the per-account
+    /// bucket, records byte metrics on success, and marks an account as
+    /// hard-stopped when the response carries a confirmed quota error message.
+    ///
+    /// Local transport failures (Io, Tls, Timeout) are recorded as failed
+    /// attempts but do NOT trigger exhaustion — only quota-like Relay errors
+    /// qualify, keeping transient network issues from false-stopping accounts.
+    async fn do_relay_once_with(
+        &self,
+        script_id: String,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<Vec<u8>, FronterError> {
+        // Defense-in-depth: if next_script_id's last-resort fallback handed us
+        // a hard-stopped account (all exhausted, none in the blacklist), refuse
+        // here before building the payload or touching the network.
+        if self.quota_tracker.is_hard_stopped(&script_id) {
+            return Err(FronterError::Relay(format!(
+                "account {} is quota-hard-stopped; skipping dispatch",
+                mask_script_id(&script_id),
+            )));
+        }
+
+        let payload: Bytes = Bytes::from(self.build_payload_json(method, url, headers, body)?);
+        let bytes_up = payload.len() as u64;
+
+        // Count ALL attempts, including retries. Each call here maps to one
+        // real UrlFetchApp.fetch() on Google's side — that's the unit Google
+        // bills against the daily quota.
+        self.quota_tracker.record_attempt(&script_id, bytes_up);
+
+        let result = self
+            .do_relay_once_inner(script_id.clone(), method, url, payload)
+            .await;
+
+        match &result {
+            Ok(bytes) => {
+                self.quota_tracker
+                    .record_success(&script_id, bytes.len() as u64);
+            }
+            Err(e) => {
+                let is_quota = is_quota_like_fronter_error(e);
+                self.quota_tracker.record_failure(&script_id, is_quota);
+                if is_quota {
+                    self.quota_tracker
+                        .mark_exhausted(&script_id, &e.to_string());
+                    tracing::warn!(
+                        "[quota] account {} exhausted: {}",
+                        mask_script_id(&script_id),
+                        e
+                    );
+                }
+            }
+        }
+
+        tracing::debug!(
+            "[quota] {} dispatch result: {}",
+            mask_script_id(&script_id),
+            match &result {
+                Ok(_) => "Ok".to_string(),
+                Err(e) => format!("Err({})", e),
+            },
+        );
+
+        result
+    }
+
+    async fn do_relay_once_inner(
+        &self,
+        script_id: String,
+        method: &str,
+        url: &str,
+        payload: Bytes,
+    ) -> Result<Vec<u8>, FronterError> {
+        // payload already built by the caller; path derived from script_id.
+        let path = format!("/macros/s/{}/exec", script_id);
+
+        // h2 fast path: one shared TCP/TLS connection multiplexes all
+        // streams.
+        //
+        // The h2 layer reports `RequestSent::No` when it can prove
+        // the request never reached Apps Script (ensure_h2 unavailable,
+        // ready/back-pressure timeout, send_request error). In that
+        // case we fall through to h1 unconditionally — there's no
+        // duplication risk.
+        //
+        // For `RequestSent::Maybe` (anything after send_request
+        // succeeded) we only fall through for HTTP-idempotent methods.
+        // POST / PUT / PATCH / DELETE get wrapped in
+        // `FronterError::NonRetryable` so `do_relay_with_retry`'s
+        // outer retry also skips replay — without that wrap, the
+        // outer retry would re-issue the request anyway and the
+        // safety policy would be illusory.
+        match self
+            .h2_relay_request(
+                &path,
+                payload.clone(),
+                Duration::from_secs(H2_RESPONSE_DEADLINE_DEFAULT_SECS),
+            )
+            .await
+        {
+            Ok((status, _hdrs, _resp_body)) if is_h2_fronting_refusal_status(status) => {
+                // Edge rejected the fronted h2 request before
+                // forwarding to Apps Script. Sticky-disable h2,
+                // log once, fall through to h1 — this request is
+                // safe to replay because it never reached Apps Script.
+                self.sticky_disable_h2_for_fronting_refusal(
+                    status,
+                    &format!("relay {} {}", method, url),
+                )
+                .await;
+                // fall through to h1
+            }
+            Ok((status, _hdrs, resp_body)) => {
+                if status != 200 {
+                    let body_txt = String::from_utf8_lossy(&resp_body)
+                        .chars()
+                        .take(200)
+                        .collect::<String>();
+                    if should_blacklist(status, &body_txt) {
+                        self.blacklist_script(&script_id, &format!("HTTP {}", status));
+                    }
+                    return Err(FronterError::Relay(format!(
+                        "Apps Script HTTP {}: {}",
+                        status, body_txt
+                    )));
+                }
+                return parse_relay_json(&resp_body, self.strip_noise_response_headers).map_err(|e| {
+                    if let FronterError::Relay(ref msg) = e {
+                        if looks_like_quota_error(msg) {
+                            self.blacklist_script(&script_id, msg);
+                        }
+                    }
+                    e
+                });
+            }
+            Err((e, RequestSent::No)) => {
+                tracing::debug!("h2 pre-send failure: {} — falling back to h1", e);
+            }
+            Err((e, RequestSent::Maybe)) => {
+                if is_method_safe_for_fanout(method) {
+                    tracing::debug!(
+                        "h2 post-send failure for safe method {}: {} — falling back to h1",
+                        method,
+                        e
+                    );
+                } else {
+                    tracing::warn!(
+                        "h2 post-send failure for non-idempotent {} {}: {} — \
+                         marking non-retryable to prevent duplicating side effects",
+                        method,
+                        url,
+                        e
+                    );
+                    // NonRetryable wrapper bubbles all the way through
+                    // do_relay_once_with → do_relay_with_retry, where
+                    // the retry loop skips its second attempt. Without
+                    // this wrap, returning a plain Err would let
+                    // do_relay_with_retry re-issue the request via h1
+                    // (or a fresh h2 cell), defeating the safety policy.
+                    return Err(FronterError::NonRetryable(Box::new(e)));
+                }
+            }
+        }
+
+        let mut entry = self.acquire().await?;
+        let reuse_ok = {
+            let write_res = async {
+                let req_head = format!(
+                    "POST {path} HTTP/1.1\r\n\
+                     Host: {host}\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {len}\r\n\
+                     Accept-Encoding: gzip\r\n\
+                     Connection: keep-alive\r\n\
+                     \r\n",
+                    path = path,
+                    host = self.http_host,
+                    len = payload.len(),
+                );
+                entry.stream.write_all(req_head.as_bytes()).await?;
+                entry.stream.write_all(&payload).await?;
+                entry.stream.flush().await?;
+
+                let (status, resp_headers, resp_body) =
+                    read_http_response(&mut entry.stream).await?;
+                Ok::<_, FronterError>((status, resp_headers, resp_body))
+            }
+            .await;
+
+            match write_res {
+                Err(e) => {
+                    // Connection may be dead — don't return to pool.
+                    return Err(e);
+                }
+                Ok((mut status, mut resp_headers, mut resp_body)) => {
+                    // Follow redirect chain (Apps Script usually redirects
+                    // /exec to googleusercontent.com). Up to 5 hops, same
+                    // connection.
+                    for _ in 0..5 {
+                        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                            break;
+                        }
+                        let Some(loc) = header_get(&resp_headers, "location") else {
+                            break;
+                        };
+                        let (rpath, rhost) = parse_redirect(&loc);
+                        let rhost = rhost.unwrap_or_else(|| self.http_host.to_string());
+                        let req = format!(
+                            "GET {rpath} HTTP/1.1\r\n\
+                             Host: {rhost}\r\n\
+                             Accept-Encoding: gzip\r\n\
+                             Connection: keep-alive\r\n\
+                             \r\n",
+                        );
+                        entry.stream.write_all(req.as_bytes()).await?;
+                        entry.stream.flush().await?;
+                        let (s, h, b) = read_http_response(&mut entry.stream).await?;
+                        status = s;
+                        resp_headers = h;
+                        resp_body = b;
+                    }
+
+                    if status != 200 {
+                        let body_txt = String::from_utf8_lossy(&resp_body)
+                            .chars()
+                            .take(200)
+                            .collect::<String>();
+                        if should_blacklist(status, &body_txt) {
+                            self.blacklist_script(&script_id, &format!("HTTP {}", status));
+                        }
+                        return Err(FronterError::Relay(format!(
+                            "Apps Script HTTP {}: {}",
+                            status, body_txt
+                        )));
+                    }
+                    match parse_relay_json(&resp_body, self.strip_noise_response_headers) {
+                        Ok(bytes) => Ok::<_, FronterError>((bytes, true)),
+                        Err(e) => {
+                            if let FronterError::Relay(ref msg) = e {
+                                if looks_like_quota_error(msg) {
+                                    self.blacklist_script(&script_id, msg);
+                                }
+                            }
+                            Err(e)
+                        }
+                    }
+                }
+            }
+        };
+
+        match reuse_ok {
+            Ok((bytes, reuse)) => {
+                if reuse {
+                    self.release(entry).await;
+                }
+                Ok(bytes)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Send a request through the configured exit node, chained inside
+    /// an Apps Script call. Path:
+    ///
+    /// ```text
+    /// client → SNI rewrite → Apps Script (Google IP)
+    ///        → UrlFetchApp.fetch(exit_node_url)
+    ///        → exit node (non-Google IP)
+    ///        → fetch(real_url)
+    ///        → response back through both layers
+    /// ```
+    ///
+    /// Apps Script sees the outer call (URL = exit_node_url, method =
+    /// POST, body = inner relay JSON authenticated with the exit-node
+    /// PSK). The exit node sees the inner JSON, fetches the real
+    /// destination, returns a `{s, h, b}` JSON envelope. Apps Script
+    /// returns that envelope as the body of its raw HTTP response
+    /// (because we set `r: true`). We then unwrap one extra layer:
+    /// extract Apps Script's body → parse the exit-node JSON → reconstruct
+    /// the destination's raw HTTP response so the rest of the proxy
+    /// pipeline (MITM TLS write-back) sees the same shape it gets from
+    /// the regular path.
+    async fn relay_via_exit_node(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<Vec<u8>, FronterError> {
+        let inner_json = self.build_exit_node_inner_payload(method, url, headers, body)?;
+
+        // The outer payload is just a normal Apps Script relay request
+        // pointing at the exit-node URL with POST + the inner JSON as body.
+        // Reusing build_payload_json keeps the outer envelope consistent
+        // with everything else (including the random padding for DPI
+        // evasion). The `r: true` flag in RelayRequest makes Code.gs
+        // return exit-node's raw HTTP response, which is what we want to
+        // unwrap below.
+        let exit_url = self.exit_node_url.clone();
+        let outer_headers = vec![(
+            "Content-Type".to_string(),
+            "application/json".to_string(),
+        )];
+        let outer_payload: Bytes = Bytes::from(
+            self.build_payload_json("POST", &exit_url, &outer_headers, &inner_json)?,
+        );
+
+        // Send the outer payload through the relay machinery and get back
+        // Apps Script's response body (which is exit-node's JSON envelope).
+        let app_body = self
+            .send_prebuilt_payload_through_relay(outer_payload)
+            .await?;
+         
+        let result = parse_exit_node_response(&app_body);
+        result
+    }
+
+    /// Build the inner-layer payload that the exit node will execute.
+    /// Same wire shape as a normal `RelayRequest` (`{k, m, u, h, b, ct, r}`)
+    /// but `k` is the exit-node PSK rather than the user's Apps Script
+    /// `auth_key`, and we skip the random-padding field — padding only
+    /// helps DPI evasion on the Iran-side leg, which the inner payload
+    /// is invisible to (it's encrypted inside the Apps Script HTTPS
+    /// connection that the ISP can't inspect).
+    fn build_exit_node_inner_payload(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<Vec<u8>, FronterError> {
+        let filtered = filter_forwarded_headers(headers);
+        let hmap = if filtered.is_empty() {
+            None
+        } else {
+            let mut m = serde_json::Map::with_capacity(filtered.len());
+            for (k, v) in &filtered {
+                m.insert(k.clone(), Value::String(v.clone()));
+            }
+            Some(m)
+        };
+        let b_encoded = if body.is_empty() {
+            None
+        } else {
+            Some(B64.encode(body))
+        };
+        let ct = if body.is_empty() {
+            None
+        } else {
+            find_header(headers, "content-type")
+        };
+        let req = RelayRequest {
+            k: &self.exit_node_psk,
+            m: method,
+            u: url,
+            h: hmap,
+            b: b_encoded,
+            ct,
+            r: false, // the exit node returns its own JSON envelope, not raw HTTP
+        };
+        Ok(serde_json::to_vec(&req)?)
+    }
+
+    /// Drive the standard script-id rotation + TLS pool send path with
+    /// a payload we already built. Mirrors `do_relay_once_with` but
+    /// returns the **raw response body bytes** (Apps Script's HTTP body)
+    /// instead of running the body through `parse_relay_json` — the
+    /// exit-node path needs to peel off exit-node's JSON envelope, which
+    /// has a different shape from Code.gs's raw-HTTP wrapping.
+    async fn send_prebuilt_payload_through_relay(
+        &self,
+        payload: Bytes,
+    ) -> Result<Vec<u8>, FronterError> {
+        let script_id = self.next_script_id();
+        let path = format!("/macros/s/{}/exec", script_id);
+
+        // h2 fast path. The exit-node outer call is always POST and
+        // carries the inner relay payload — replaying on h1 after the
+        // outer reached Apps Script duplicates the inner request to
+        // the exit node. Only fall back when h2 definitely never sent.
+        // Same default response deadline as the direct path; the
+        // exit-node leg ultimately exits via Apps Script too.
+        match self
+            .h2_relay_request(
+                &path,
+                payload.clone(),
+                Duration::from_secs(H2_RESPONSE_DEADLINE_DEFAULT_SECS),
+            )
+            .await
+        {
+            Ok((status, _hdrs, _resp_body)) if is_h2_fronting_refusal_status(status) => {
+                // Same fronting-refusal path as the direct relay.
+                // Safe to fall back: 421 means the edge rejected
+                // before invoking the exit node.
+                self.sticky_disable_h2_for_fronting_refusal(
+                    status,
+                    "exit-node outer call",
+                )
+                .await;
+                // fall through to h1
+            }
+            Ok((status, _hdrs, resp_body)) => {
+                if status != 200 {
+                    let body_txt = String::from_utf8_lossy(&resp_body)
+                        .chars()
+                        .take(200)
+                        .collect::<String>();
+                    return Err(FronterError::Relay(format!(
+                        "Apps Script HTTP {} (exit-node outer call): {}",
+                        status, body_txt
+                    )));
+                }
+                return Ok(resp_body);
+            }
+            Err((e, RequestSent::No)) => {
+                tracing::debug!(
+                    "h2 exit-node outer call pre-send failure: {} — falling back to h1",
+                    e
+                );
+            }
+            Err((e, RequestSent::Maybe)) => {
+                tracing::warn!(
+                    "h2 exit-node outer call post-send failure: {} — \
+                     marking non-retryable to prevent duplicating the inner request",
+                    e
+                );
+                // NonRetryable propagates back to relay()'s exit-node
+                // match arm, which will *not* fall through to the
+                // direct Apps Script path (that fall-through would
+                // re-send the outer call and could also re-trigger
+                // the inner request to the destination).
+                return Err(FronterError::NonRetryable(Box::new(e)));
+            }
+        }
+
+        let mut entry = self.acquire().await?;
+        let req_head = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Accept-Encoding: gzip\r\n\
+             Connection: keep-alive\r\n\
+             \r\n",
+            path = path,
+            host = self.http_host,
+            len = payload.len(),
+        );
+        entry.stream.write_all(req_head.as_bytes()).await?;
+        entry.stream.write_all(&payload).await?;
+        entry.stream.flush().await?;
+
+        let (mut status, mut resp_headers, mut resp_body) =
+            read_http_response(&mut entry.stream).await?;
+
+        // Follow Apps Script's /exec → /macros/.../exec redirect chain
+        // (typical: 1-2 hops to script.googleusercontent.com). Mirrors
+        // the redirect handling in do_relay_once_with.
+        for _ in 0..5 {
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                break;
+            }
+            let Some(loc) = header_get(&resp_headers, "location") else {
+                break;
+            };
+            let (rpath, rhost) = parse_redirect(&loc);
+            let rhost = rhost.unwrap_or_else(|| self.http_host.to_string());
+            let req = format!(
+                "GET {rpath} HTTP/1.1\r\n\
+                 Host: {rhost}\r\n\
+                 Accept-Encoding: gzip\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n",
+            );
+            entry.stream.write_all(req.as_bytes()).await?;
+            entry.stream.flush().await?;
+            let (s, h, b) = read_http_response(&mut entry.stream).await?;
+            status = s;
+            resp_headers = h;
+            resp_body = b;
+        }
+
+        // Don't return to pool — the exit-node path is rare enough that
+        // the connection-reuse semantics aren't worth replicating here.
+        drop(entry);
+
+        if status != 200 {
+            let body_txt = String::from_utf8_lossy(&resp_body)
+                .chars()
+                .take(200)
+                .collect::<String>();
+            return Err(FronterError::Relay(format!(
+                "Apps Script HTTP {} (exit-node outer call): {}",
+                status, body_txt
+            )));
+        }
+        Ok(resp_body)
+    }
+
+    fn build_payload_json(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<Vec<u8>, FronterError> {
+        let filtered = filter_forwarded_headers(headers);
+        let hmap = if filtered.is_empty() {
+            None
+        } else {
+            let mut m = serde_json::Map::with_capacity(filtered.len());
+            for (k, v) in &filtered {
+                m.insert(k.clone(), Value::String(v.clone()));
+            }
+            Some(m)
+        };
+        let b_encoded = if body.is_empty() {
+            None
+        } else {
+            Some(B64.encode(body))
+        };
+        let ct = if body.is_empty() {
+            None
+        } else {
+            find_header(headers, "content-type")
+        };
+        let req = RelayRequest {
+            k: &self.auth_key,
+            m: method,
+            u: url,
+            h: hmap,
+            b: b_encoded,
+            ct,
+            r: true,
+        };
+        // Serialize via Value so we can splice in the random `_pad` field
+        // without changing RelayRequest's wire schema. Apps Script ignores
+        // unknown JSON fields, so old Code.gs deployments stay compatible
+        // — the pad is just bytes-on-the-wire that the server sees and
+        // discards.
+        let mut v = serde_json::to_value(&req)?;
+        if let Value::Object(map) = &mut v {
+            if !self.disable_padding {
+                add_random_pad(map);
+            }
+        }
+        Ok(serde_json::to_vec(&v)?)
+    }
+
+    // ────── Full-mode tunnel protocol ──────────────────────────────────
+
+    /// Send a tunnel-protocol request through the domain-fronted connection
+    /// to Apps Script. Reuses the same TLS pool as `relay()` but builds a
+    /// tunnel JSON payload (the `t` field triggers `_doTunnel` in CodeFull.gs).
+    pub async fn tunnel_request(
+        &self,
+        op: &str,
+        host: Option<&str>,
+        port: Option<u16>,
+        sid: Option<&str>,
+        data: Option<String>,
+    ) -> Result<TunnelResponse, FronterError> {
+        let payload: Bytes =
+            Bytes::from(self.build_tunnel_payload(op, host, port, sid, data)?);
+        let script_id = self.next_script_id();
+        let path = format!("/macros/s/{}/exec", script_id);
+
+        // Skip h2 for tunnel ops — same rationale as tunnel_batch_request_to
+        // (PR #1040): tunnel ops are already single HTTP requests, h2
+        // multiplexing adds no benefit and causes 16-17s long-poll stalls.
+        let mut entry = self.acquire().await?;
+
+        let req_head = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Accept-Encoding: gzip\r\n\
+             Connection: keep-alive\r\n\
+             \r\n",
+            path = path,
+            host = self.http_host,
+            len = payload.len(),
+        );
+        entry.stream.write_all(req_head.as_bytes()).await?;
+        entry.stream.write_all(&payload).await?;
+        entry.stream.flush().await?;
+
+        let (mut status, mut resp_headers, mut resp_body) =
+            read_http_response(&mut entry.stream).await?;
+
+        // Follow redirect chain (Apps Script usually redirects /exec to
+        // googleusercontent.com). Same logic as do_relay_once_with.
+        for _ in 0..5 {
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                break;
+            }
+            let Some(loc) = header_get(&resp_headers, "location") else {
+                break;
+            };
+            let (rpath, rhost) = parse_redirect(&loc);
+            let rhost = rhost.unwrap_or_else(|| self.http_host.to_string());
+            let req = format!(
+                "GET {rpath} HTTP/1.1\r\n\
+                 Host: {rhost}\r\n\
+                 Accept-Encoding: gzip\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n",
+            );
+            entry.stream.write_all(req.as_bytes()).await?;
+            entry.stream.flush().await?;
+            let (s, h, b) = read_http_response(&mut entry.stream).await?;
+            status = s;
+            resp_headers = h;
+            resp_body = b;
+        }
+
+        let resp = self.finalize_tunnel_response(&script_id, status, resp_body)?;
+        self.release(entry).await;
+        Ok(resp)
+    }
+
+    /// Validate a tunnel-protocol response (status check + Apps-Script
+    /// HTML-prefix tolerance + JSON parse). Used by both the h2 and h1
+    /// branches of `tunnel_request` so the parsing logic doesn't drift
+    /// across transports.
+    fn finalize_tunnel_response(
+        &self,
+        script_id: &str,
+        status: u16,
+        resp_body: Vec<u8>,
+    ) -> Result<TunnelResponse, FronterError> {
+        if status != 200 {
+            let body_txt = String::from_utf8_lossy(&resp_body)
+                .chars()
+                .take(200)
+                .collect::<String>();
+            if should_blacklist(status, &body_txt) {
+                self.blacklist_script(script_id, &format!("HTTP {}", status));
+            }
+            return Err(FronterError::Relay(format!(
+                "tunnel HTTP {}: {}",
+                status, body_txt
+            )));
+        }
+        let text = std::str::from_utf8(&resp_body)
+            .map_err(|_| FronterError::BadResponse("non-utf8 tunnel response".into()))?
+            .trim();
+        // Apps Script may prepend HTML on cold-start or quota-exceeded
+        // pages; extract the first {...} block tolerantly so we don't
+        // bail on a recoverable warning frame.
+        let json_str = if text.starts_with('{') {
+            text
+        } else {
+            let start = text.find('{').ok_or_else(|| {
+                FronterError::BadResponse(format!(
+                    "no json in tunnel response: {}",
+                    &text.chars().take(200).collect::<String>()
+                ))
+            })?;
+            let end = text.rfind('}').ok_or_else(|| {
+                FronterError::BadResponse("no json end in tunnel response".into())
+            })?;
+            if start > end {
+                return Err(FronterError::BadResponse(format!(
+                    "no valid json object in: {}",
+                    &text.chars().take(200).collect::<String>()
+                )));
+            }
+            &text[start..=end]
+        };
+        Ok(serde_json::from_str(json_str)?)
+    }
+
+    fn build_tunnel_payload(
+        &self,
+        op: &str,
+        host: Option<&str>,
+        port: Option<u16>,
+        sid: Option<&str>,
+        data: Option<String>,
+    ) -> Result<Vec<u8>, FronterError> {
+        let mut map = serde_json::Map::new();
+        map.insert("k".into(), Value::String(self.auth_key.clone()));
+        map.insert("t".into(), Value::String(op.to_string()));
+        if let Some(h) = host {
+            map.insert("h".into(), Value::String(h.to_string()));
+        }
+        if let Some(p) = port {
+            map.insert("p".into(), Value::Number(serde_json::Number::from(p)));
+        }
+        if let Some(s) = sid {
+            map.insert("sid".into(), Value::String(s.to_string()));
+        }
+        if let Some(d) = data {
+            map.insert("d".into(), Value::String(d));
+        }
+        if !self.disable_padding {
+            add_random_pad(&mut map);
+        }
+        Ok(serde_json::to_vec(&Value::Object(map))?)
+    }
+
+    /// Send a batch of tunnel operations in one Apps Script round trip.
+    /// All active sessions' data is collected and sent together, and all
+    /// responses come back in one response. This reduces N Apps Script
+    /// calls to 1 per tick.
+    pub async fn tunnel_batch_request(
+        &self,
+        ops: &[BatchOp],
+    ) -> Result<BatchTunnelResponse, FronterError> {
+        let script_id = self.next_script_id();
+        self.tunnel_batch_request_to(&script_id, ops).await
+    }
+
+    /// Like `tunnel_batch_request` but targets a specific deployment ID.
+    /// Used by the pipeline mux to pin a batch to a deployment whose
+    /// per-account concurrency slot has already been acquired.
+    pub async fn tunnel_batch_request_to(
+        &self,
+        script_id: &str,
+        ops: &[BatchOp],
+    ) -> Result<BatchTunnelResponse, FronterError> {
+        let mut map = serde_json::Map::new();
+        map.insert("k".into(), Value::String(self.auth_key.clone()));
+        map.insert("t".into(), Value::String("batch".into()));
+        if self.zstd_enabled.load(Ordering::Relaxed) {
+            let ops_json = serde_json::to_vec(ops)?;
+            match zstd::encode_all(ops_json.as_slice(), 3) {
+                Ok(compressed) => {
+                    map.insert("zops".into(), Value::String(B64.encode(&compressed)));
+                }
+                Err(_) => {
+                    map.insert("ops".into(), serde_json::to_value(ops)?);
+                }
+            }
+        } else {
+            map.insert("ops".into(), serde_json::to_value(ops)?);
+        }
+        map.insert("zc".into(), Value::Number(1.into()));
+        if !self.disable_padding {
+            add_random_pad(&mut map);
+        }
+        let payload: Bytes = Bytes::from(serde_json::to_vec(&Value::Object(map))?);
+
+        let path = format!("/macros/s/{}/exec", script_id);
+
+        // Skip h2 for tunnel batches. Batched ops are already coalesced
+        // into one HTTP request so h2 multiplexing adds no benefit.
+        // The h1 pool path is simpler and avoids h2-specific overhead
+        // (ready timeout, NonRetryable errors, concurrent stream
+        // contention with long-poll batches).
+        let mut entry = self.acquire().await?;
+
+        let req_head = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Accept-Encoding: gzip\r\n\
+             Connection: keep-alive\r\n\
+             \r\n",
+            path = path,
+            host = self.http_host,
+            len = payload.len(),
+        );
+        entry.stream.write_all(req_head.as_bytes()).await?;
+        entry.stream.write_all(&payload).await?;
+        entry.stream.flush().await?;
+
+        // Use the configured `request_timeout_secs` for the header read,
+        // not the hardcoded 10 s default. With Apps Script cold starts
+        // routinely landing in the 8–12 s range, the 10 s cliff was
+        // firing as a false-positive batch timeout (issue #1088), killing
+        // every in-flight tunnel session under it. The outer
+        // `tokio::time::timeout(batch_timeout, ...)` in `fire_batch`
+        // remains the authoritative bound on total batch round-trip time.
+        let batch_timeout = self.batch_timeout();
+        let (mut status, mut resp_headers, mut resp_body) =
+            read_http_response_with_header_timeout(&mut entry.stream, batch_timeout).await?;
+
+        // Follow redirect chain
+        for _ in 0..5 {
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) { break; }
+            let Some(loc) = header_get(&resp_headers, "location") else { break; };
+            let (rpath, rhost) = parse_redirect(&loc);
+            let rhost = rhost.unwrap_or_else(|| self.http_host.to_string());
+            let req = format!(
+                "GET {rpath} HTTP/1.1\r\nHost: {rhost}\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n",
+            );
+            entry.stream.write_all(req.as_bytes()).await?;
+            entry.stream.flush().await?;
+            let (s, h, b) =
+                read_http_response_with_header_timeout(&mut entry.stream, batch_timeout).await?;
+            status = s; resp_headers = h; resp_body = b;
+        }
+
+        // Route through the same `finalize_batch_response` helper the
+        // h2 path uses. This keeps the redacted-logging policy in
+        // exactly one place — the previous inline parse here logged
+        // raw payload at debug AND error level, which leaked the
+        // base64-encoded tunneled bytes (TCP/UDP packets, possibly
+        // app data or credentials) into bug-report logs. Both
+        // transports now emit only `status=` + `body_len=`, with the
+        // raw body gated behind RUST_LOG=trace.
+        let resp = self.finalize_batch_response(script_id, status, resp_body)?;
+        self.release(entry).await;
+        Ok(resp)
+    }
+
+    /// Parse a batch-tunnel response body once we already have it in
+    /// hand — used by the h2 fast path in `tunnel_batch_request_to`,
+    /// where the response is read off a multiplexed stream rather than
+    /// drained from a checked-out socket. Mirrors the validate-and-parse
+    /// tail of the h1 path (status check + JSON extraction +
+    /// quota-blacklist book-keeping).
+    fn finalize_batch_response(
+        &self,
+        script_id: &str,
+        status: u16,
+        resp_body: Vec<u8>,
+    ) -> Result<BatchTunnelResponse, FronterError> {
+        if status != 200 {
+            let body_txt = String::from_utf8_lossy(&resp_body)
+                .chars()
+                .take(200)
+                .collect::<String>();
+            if should_blacklist(status, &body_txt) {
+                self.blacklist_script(script_id, &format!("HTTP {}", status));
+            }
+            return Err(FronterError::Relay(format!(
+                "batch tunnel HTTP {}: {}",
+                status, body_txt
+            )));
+        }
+        let text = std::str::from_utf8(&resp_body)
+            .map_err(|_| FronterError::BadResponse("non-utf8 batch response".into()))?
+            .trim();
+        let json_str = if text.starts_with('{') {
+            text
+        } else {
+            let start = text.find('{').ok_or_else(|| {
+                FronterError::BadResponse(format!(
+                    "no json in batch response: {}",
+                    &text.chars().take(200).collect::<String>()
+                ))
+            })?;
+            let end = text.rfind('}').ok_or_else(|| {
+                FronterError::BadResponse("no json end in batch response".into())
+            })?;
+            if start > end {
+                return Err(FronterError::BadResponse(format!(
+                    "no valid json object in: {}",
+                    &text.chars().take(200).collect::<String>()
+                )));
+            }
+            &text[start..=end]
+        };
+        // Don't log payload content. Batch responses carry base64-encoded
+        // tunneled bytes (TCP/UDP packets, possibly app data, possibly
+        // credentials), and even at debug level a leaked log line ends
+        // up in user-shared bug reports. Status + length are sufficient
+        // for diagnosis; full body is available behind RUST_LOG=trace.
+        tracing::debug!(
+            "batch response: status={} body_len={}",
+            status,
+            json_str.len()
+        );
+        tracing::trace!(
+            "batch response body (trace only): {}",
+            &json_str[..json_str.len().min(500)]
+        );
+        match serde_json::from_str::<BatchTunnelResponse>(json_str) {
+            Ok(mut resp) => {
+                if let Some(zr_b64) = resp.zr.take() {
+                    match B64.decode(&zr_b64) {
+                        Ok(compressed) => match zstd::decode_all(compressed.as_slice()) {
+                            Ok(decompressed) => match serde_json::from_slice(&decompressed) {
+                                Ok(r) => { resp.r = r; }
+                                Err(e) => tracing::error!("zr json parse failed: {}", e),
+                            },
+                            Err(e) => tracing::error!("zr zstd decompress failed: {}", e),
+                        },
+                        Err(e) => tracing::error!("zr base64 decode failed: {}", e),
+                    }
+                }
+                if resp.zc.is_some() && !self.zstd_enabled.load(Ordering::Relaxed) {
+                    tracing::info!("tunnel-node supports zstd, enabling compressed batches");
+                    self.zstd_enabled.store(true, Ordering::Relaxed);
+                }
+                Ok(resp)
+            }
+            Err(e) => {
+                // Same redaction policy on the error path. Length and
+                // the serde error message are enough to locate the
+                // parse failure (offset / unexpected-token info comes
+                // from `e` itself); the raw body is trace-only.
+                tracing::error!(
+                    "batch JSON parse error: {} (body_len={})",
+                    e,
+                    json_str.len()
+                );
+                tracing::trace!(
+                    "batch parse-error body (trace only): {}",
+                    &json_str[..json_str.len().min(300)]
+                );
+                Err(FronterError::Json(e))
+            }
+        }
+    }
+}
+
+/// Strip connection-specific headers (matches Code.gs SKIP_HEADERS) and
+/// strip Accept-Encoding: br (Apps Script can't decompress brotli).
+/// Extract the host (no scheme, no port, no path) from a URL string.
+/// Returns None for malformed / scheme-less inputs.
+/// Trim X/Twitter GraphQL URLs down to just the `variables=` query param,
+/// stripping everything from the first `&` in the query onward. See the
+/// `normalize_x_graphql` config field for the why.
+///
+/// Exact pattern mirrored from the Python community patch (issue #16):
+///
+///   host == "x.com"
+///   && path starts with "/i/api/graphql/"
+///   && query starts with "variables="
+///   → truncate at first `&` past the `?`.
+///
+/// Returns the possibly-rewritten URL. If the URL doesn't match the
+/// pattern the input is returned unchanged (as an owned String — the
+/// allocation is cheap on the slow path and keeps the caller's
+/// type-signature-juggling simple).
+// ─── HTTP response helpers used by relay_parallel_range ──────────────────
+
+/// Split an HTTP/1.x response blob into `(status, headers, body)`.
+/// Returns `None` if the buffer doesn't even have a status line + CRLFCRLF
+/// separator — the caller should then pass the bytes through unchanged.
+fn split_response(raw: &[u8]) -> Option<(u16, Vec<(String, String)>, &[u8])> {
+    // Locate end-of-headers.
+    let sep = b"\r\n\r\n";
+    let sep_pos = raw.windows(sep.len()).position(|w| w == sep)?;
+    let head = &raw[..sep_pos];
+    let body = &raw[sep_pos + sep.len()..];
+
+    let mut lines = head.split(|&b| b == b'\n');
+    let status_line = lines.next()?;
+    // Status line: "HTTP/1.1 206 Partial Content"
+    let status_line = std::str::from_utf8(status_line).ok()?.trim_end_matches('\r');
+    let mut parts = status_line.splitn(3, ' ');
+    let _version = parts.next()?;
+    let code = parts.next()?.parse::<u16>().ok()?;
+
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in lines {
+        let line = std::str::from_utf8(line).ok()?.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+
+    Some((code, headers, body))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentRange {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+/// Parse `Content-Range: bytes START-END/TOTAL`.
+fn parse_content_range(headers: &[(String, String)]) -> Option<ContentRange> {
+    let cr = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))?;
+    let value = cr.1.trim();
+    let (unit, rest) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = rest.trim_start().split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = end.trim().parse::<u64>().ok()?;
+    let total = total.trim().parse::<u64>().ok()?;
+    if start > end || total == 0 || end >= total {
+        return None;
+    }
+    Some(ContentRange { start, end, total })
+}
+
+/// Pull the total size out of a valid `Content-Range: bytes START-END/TOTAL` header.
+fn parse_content_range_total(headers: &[(String, String)]) -> Option<u64> {
+    parse_content_range(headers).map(|r| r.total)
+}
+
+fn content_range_matches_body(range: ContentRange, body_len: usize) -> bool {
+    body_len > 0 && (range.end - range.start + 1) == body_len as u64
+}
+
+fn validate_probe_range(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    requested_end: u64,
+) -> Option<ContentRange> {
+    if status != 206 {
+        return None;
+    }
+    let range = parse_content_range(headers)?;
+    if range.start != 0 || range.end > requested_end {
+        return None;
+    }
+    if content_range_matches_body(range, body.len())
+        || probe_range_covers_complete_entity(range, requested_end)
+    {
+        return Some(range);
+    }
+    None
+}
+
+/// Parse the start byte from a `Range: bytes=N-` or `Range: bytes=N-M` header value.
+fn parse_range_start(range_header: &str) -> Option<u64> {
+    let s = range_header.trim().strip_prefix("bytes=")?;
+    s.split('-').next()?.trim().parse::<u64>().ok()
+}
+
+/// Variant of `validate_probe_range` for mid-file resume probes where
+/// `Content-Range: bytes N-M/total` has a non-zero start.
+fn validate_probe_range_at_offset(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    req_start: u64,
+    req_end: u64,
+) -> Option<ContentRange> {
+    if status != 206 {
+        return None;
+    }
+    let range = parse_content_range(headers)?;
+    if range.start != req_start || range.end > req_end {
+        return None;
+    }
+    if content_range_matches_body(range, body.len()) {
+        return Some(range);
+    }
+    None
+}
+
+fn probe_range_covers_complete_entity(range: ContentRange, requested_end: u64) -> bool {
+    // Apps Script may decode a gzip body while preserving the origin's
+    // compressed Content-Range. For the synthetic first probe only, a
+    // 0..total-1 range within the requested chunk is enough to prove we
+    // already have the complete entity; later chunks still require exact
+    // Content-Range/body length validation in extract_exact_range_body().
+    range.start == 0
+        && range.end.saturating_add(1) >= range.total
+        && range.total <= requested_end.saturating_add(1)
+}
+
+fn extract_exact_range_body(
+    raw: &[u8],
+    start: u64,
+    end: u64,
+    total: u64,
+) -> Result<Vec<u8>, &'static str> {
+    let (status, headers, body) = split_response(raw).ok_or("malformed HTTP response")?;
+    if status != 206 {
+        return Err("expected 206 Partial Content");
+    }
+    let range = parse_content_range(&headers).ok_or("missing or invalid Content-Range")?;
+    if range.start != start || range.end != end || range.total != total {
+        return Err("unexpected Content-Range");
+    }
+    if !content_range_matches_body(range, body.len()) {
+        return Err("Content-Range/body length mismatch");
+    }
+    Ok(body.to_vec())
+}
+
+/// Rewrite a 206 response to a 200 OK, dropping Content-Range and
+/// recomputing Content-Length. Used when we probed with a synthetic
+/// Range header but the client sent a plain GET — handing a 206 back to
+/// XHR/fetch code on some sites (x.com, Cloudflare Turnstile) makes them
+/// treat the response as aborted. Same rationale as the upstream Python
+/// `_rewrite_206_to_200`.
+fn rewrite_206_to_200(raw: &[u8]) -> Vec<u8> {
+    let (_status, headers, body) = match split_response(raw) {
+        Some(v) => v,
+        None => return raw.to_vec(),
+    };
+    assemble_full_200(&headers, body)
+}
+
+/// Build a complete `HTTP/1.1 200 OK` response with the given header
+/// set + body. Skips headers the caller shouldn't be forwarding
+/// verbatim (content-length/range/encoding, transfer-encoding, hop-by-hop
+/// wire-level stuff) — we set Content-Length from the body we're
+/// actually shipping.
+fn assemble_full_200(src_headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
+    let mut out = assemble_200_head(src_headers, body.len() as u64);
+    out.extend_from_slice(body);
+    out
+}
+
+/// Build only the `HTTP/1.1 200 OK` head block — status line, headers,
+/// and the `\r\n\r\n` terminator — with `Content-Length:
+/// declared_length`. Used by the streaming side of the range-parallel
+/// path, where the body hasn't been assembled yet but we know its
+/// total size from the probe's `Content-Range`. Matches
+/// `assemble_full_200`'s header-skip rules so the two paths produce
+/// identical headers for a given probe.
+fn assemble_200_head(src_headers: &[(String, String)], declared_length: u64) -> Vec<u8> {
+    let skip = |k: &str| {
+        matches!(
+            k.to_ascii_lowercase().as_str(),
+            "content-length"
+                | "content-range"
+                | "content-encoding"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive",
+        )
+    };
+    let mut out: Vec<u8> = b"HTTP/1.1 200 OK\r\n".to_vec();
+    for (k, v) in src_headers {
+        if skip(k) {
+            continue;
+        }
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", declared_length).as_bytes());
+    out
+}
+
+/// Build a `HTTP/1.1 206 Partial Content` head for the resume streaming
+/// path. `start` is the first byte the client requested; `total` is the
+/// full file size reported by the origin's `Content-Range`. Mirrors
+/// `assemble_200_head`'s header-skip rules.
+fn assemble_206_head(src_headers: &[(String, String)], start: u64, total: u64) -> Vec<u8> {
+    let skip = |k: &str| {
+        matches!(
+            k.to_ascii_lowercase().as_str(),
+            "content-length"
+                | "content-range"
+                | "content-encoding"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive",
+        )
+    };
+    let length = total.saturating_sub(start);
+    let mut out: Vec<u8> = b"HTTP/1.1 206 Partial Content\r\n".to_vec();
+    for (k, v) in src_headers {
+        if skip(k) {
+            continue;
+        }
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(
+        format!(
+            "Content-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+            start,
+            total - 1,
+            total,
+            length,
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// Apply `transform_head` to the head block of an HTTP/1.x response
+/// (everything up to and including the first `\r\n\r\n` terminator),
+/// then write the transformed head followed by the unchanged body to
+/// `writer`. If the response can't be parsed as HTTP/1.x (no header
+/// terminator), passes the bytes through unchanged. This is the
+/// buffered-path bridge to the writer-based API: callers see the
+/// same head-rewrite policy regardless of whether we took the
+/// streaming or buffered branch.
+async fn write_response_with_head_transform<W, F>(
+    writer: &mut W,
+    response: &[u8],
+    transform_head: &F,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    F: Fn(&[u8]) -> Vec<u8>,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let sep = b"\r\n\r\n";
+    let Some(idx) = response.windows(sep.len()).position(|w| w == sep) else {
+        writer.write_all(response).await?;
+        return Ok(());
+    };
+    let head_with_terminator = &response[..idx + sep.len()];
+    let body = &response[idx + sep.len()..];
+    let new_head = transform_head(head_with_terminator);
+    writer.write_all(&new_head).await?;
+    writer.write_all(body).await?;
+    Ok(())
+}
+
+/// Three-way dispatch for the range-parallel response delivery in
+/// `do_relay_parallel_range_to`. Extracted as a pure function so the
+/// branching contract is unit-testable without a live `DomainFronter`,
+/// and split into an enum so the writer-based and `Vec<u8>` APIs can
+/// pick different cutoffs (which is exactly the regression that
+/// motivated PR #1043's third-round review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeDispatch {
+    /// Stitch all chunks into a single in-memory buffer, then deliver
+    /// the response to the writer in one shot. Chunk failure falls
+    /// back to a single GET — which actually recovers when the file
+    /// fits through Apps Script's response cap.
+    Buffered,
+    /// Write the response head + probe body to the wire, then stream
+    /// each remaining chunk in order. Chunk failure truncates the
+    /// response and surfaces as a Content-Length mismatch the
+    /// download client resumes via Range. Only reachable from the
+    /// writer-based API (`streaming_allowed=true`).
+    Stream,
+    /// Fall back to a plain `self.relay()` single GET. Used by the
+    /// `Vec<u8>` compatibility wrapper when the response would
+    /// exceed the buffered stitch buffer's memory cap and the wrapper
+    /// can't take the streaming branch (a `Vec<u8>` consumer can't
+    /// react to a truncated 200 OK — Issue #162).
+    FallbackSingleGet,
+    /// Refuse the response outright with a 502. Only reachable from
+    /// the writer-based API for advertised totals above
+    /// [`MAX_STREAMED_RANGE_BYTES`]. Prevents an absurd
+    /// `Content-Range` total from turning one GET into an unbounded
+    /// stream of chunk Apps Script calls (quota drain DoS — see the
+    /// constant's doc). The compat wrapper has the lower
+    /// [`BUFFERED_STITCH_MAX_BYTES`] cliff above it, so this variant
+    /// is not reachable via `streaming_allowed=false`.
+    RejectTooLarge,
+}
+
+/// Decide how to deliver a range-capable response of size `total`.
+///
+/// Two callers, two contracts:
+///   * Writer-based public API ([`DomainFronter::relay_parallel_range_to`])
+///     passes `streaming_allowed=true`. It streams above
+///     [`APPS_SCRIPT_BODY_MAX_BYTES`] (40 MiB) — that's where
+///     single-GET fallback would fail through Apps Script anyway,
+///     so streaming with truncate-and-resume beats a hard 504.
+///   * `Vec<u8>` compatibility wrapper
+///     ([`DomainFronter::relay_parallel_range`]) passes
+///     `streaming_allowed=false`. It buffers up to
+///     [`BUFFERED_STITCH_MAX_BYTES`] (64 MiB) and only falls back to
+///     single GET above that. The 40-64 MiB band still stitches
+///     successfully (the pre-1.9.23 behavior); above 64 MiB the
+///     wrapper returns whatever Apps Script's single-GET returns
+///     (typically 502/504), matching the pre-1.9.23 cliff exactly.
+fn dispatch_range_response(total: u64, streaming_allowed: bool) -> RangeDispatch {
+    if streaming_allowed && total > MAX_STREAMED_RANGE_BYTES {
+        // Quota-DoS guard for the writer API. The wrapper never
+        // hits this branch because its `streaming_allowed=false`
+        // path is gated by the lower `BUFFERED_STITCH_MAX_BYTES`
+        // (64 MiB) cliff above — Apps Script's single-GET refuses
+        // the response there, no chunk loop runs.
+        RangeDispatch::RejectTooLarge
+    } else if streaming_allowed && total > APPS_SCRIPT_BODY_MAX_BYTES {
+        RangeDispatch::Stream
+    } else if !streaming_allowed && total > BUFFERED_STITCH_MAX_BYTES {
+        RangeDispatch::FallbackSingleGet
+    } else {
+        RangeDispatch::Buffered
+    }
+}
+
+/// Lazy iterator over the byte ranges that need to be fetched after
+/// the probe. Yields `(start, end)` pairs of inclusive byte indices,
+/// each ≤ `chunk_size` long, covering `(probe_end, total - 1]`.
+///
+/// Crucially this is `O(1)` memory regardless of `total`. A hostile or
+/// buggy origin advertising `Content-Range: bytes 0-262143/<huge>`
+/// can pass the probe checks (matching 256 KiB body, valid total) but
+/// must not be allowed to drive an eager `Vec<(u64, u64)>` allocation
+/// — at 256 KiB chunks a claimed 100 TiB total is ~400M tuples
+/// (~6 GB resident). PR #151's original guard was a fixed
+/// `MAX_STITCHED_RANGE_BYTES` cap; the writer-based path replaces it
+/// with this lazy iterator so streaming downloads have no hard size
+/// ceiling but also no eager allocation.
+fn plan_remaining_ranges(
+    probe_end: u64,
+    total: u64,
+    chunk_size: u64,
+) -> impl Iterator<Item = (u64, u64)> {
+    let mut start = probe_end.saturating_add(1);
+    std::iter::from_fn(move || {
+        if start >= total {
+            return None;
+        }
+        let s = start;
+        let e = (s.saturating_add(chunk_size).saturating_sub(1)).min(total - 1);
+        start = e.saturating_add(1);
+        Some((s, e))
+    })
+}
+
+/// Streaming write loop for the range-parallel path. Writes `head`,
+/// then `probe_body`, then each chunk from `fetches` in input order
+/// (which is by-range-start since `fetch_chunks_stream` uses
+/// `buffered` to preserve order). On the first validation failure
+/// flushes the committed prefix and returns `Err`; the partial
+/// response surfaces to the download client as a truncated body
+/// (Content-Length mismatch), which most clients — curl `-C -`,
+/// browsers' built-in download manager, wget — treat as a resumable
+/// failure and reissue via Range from the partial byte count.
+///
+/// The pre-Err flush is load-bearing on TLS streams (and to a
+/// lesser extent on plain sockets with the kernel send buffer):
+/// `write_all` returns once the bytes are in the TLS writer's
+/// in-memory buffer, NOT once they've been encrypted and shipped
+/// down the socket. If we returned `Err` without flushing, the
+/// caller's `?` typically propagates the error and the connection
+/// is dropped — taking buffered ciphertext with it. The client then
+/// sees a clean connection close before any body bytes, instead of
+/// the partial body it needs to compute a resume offset.
+///
+/// Kept as a free function (no `&self`) so the streaming logic can be
+/// unit-tested with synthetic `Stream`s built from `stream::iter(…)`
+/// instead of needing a fully-constructed `DomainFronter`.
+async fn stream_chunks_to_writer<W, S>(
+    writer: &mut W,
+    head: &[u8],
+    probe_body: &[u8],
+    total: u64,
+    fetches: S,
+    url_for_log: &str,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    S: futures_util::Stream<Item = (u64, u64, Result<Vec<u8>, &'static str>)>,
+{
+    use futures_util::stream::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    writer.write_all(head).await?;
+    writer.write_all(probe_body).await?;
+    // Flush head + probe body to the wire before kicking off remote
+    // chunk fetches. First bytes hit the client immediately so the
+    // browser / download manager sees the response start (status
+    // code + Content-Length, plus the first 256 KiB of body) while
+    // the Apps Script round-trips for the remaining chunks are in
+    // flight. Without this, intermediate buffering (TLS writer
+    // buffer, kernel send buffer with small initial cwnd, browsers'
+    // own pre-read thresholds) can make the progress bar sit at
+    // zero for the first several hundred ms of the download.
+    //
+    // Propagate flush errors here — if the client already
+    // disconnected, no point firing N more Apps Script calls.
+    writer.flush().await?;
+    futures_util::pin_mut!(fetches);
+
+    // Progress accounting: bytes emitted as wire body so far (the
+    // probe body, plus every successfully-written chunk). The head
+    // doesn't count — it's protocol framing, not body progress.
+    // `next_progress_log_at` is the next body-byte threshold at
+    // which we emit a progress line, advanced past the current
+    // count each time so a single large chunk crossing multiple
+    // intervals only logs once.
+    let mut body_bytes_emitted: u64 = probe_body.len() as u64;
+    let mut next_progress_log_at: u64 = STREAM_PROGRESS_LOG_INTERVAL_BYTES;
+
+    while let Some((s, e, chunk_result)) = fetches.next().await {
+        match chunk_result {
+            Ok(c) => {
+                writer.write_all(&c).await?;
+                body_bytes_emitted = body_bytes_emitted.saturating_add(c.len() as u64);
+                if body_bytes_emitted >= next_progress_log_at {
+                    // Percentage is well-defined here: streaming
+                    // branch is only reached for total >
+                    // APPS_SCRIPT_BODY_MAX_BYTES (≥ 40 MiB), so the
+                    // divisor is never zero.
+                    let pct = (body_bytes_emitted * 100) / total;
+                    tracing::info!(
+                        "range-parallel-stream: {}/{} MiB ({}%) emitted for {}",
+                        body_bytes_emitted / (1024 * 1024),
+                        total / (1024 * 1024),
+                        pct,
+                        url_for_log,
+                    );
+                    // Advance to the next interval past the current
+                    // count — a chunk much larger than the interval
+                    // (shouldn't happen at 256 KiB chunks, but defend
+                    // against future tuning) skips intermediate
+                    // thresholds rather than firing N log lines back
+                    // to back.
+                    next_progress_log_at = body_bytes_emitted
+                        .saturating_add(STREAM_PROGRESS_LOG_INTERVAL_BYTES);
+                }
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    "range-parallel-stream: invalid chunk {}-{} for {} ({}); truncating response",
+                    s, e, url_for_log, reason,
+                );
+                // Flush the committed prefix to the wire before
+                // declaring failure — see function doc. We
+                // deliberately ignore a flush failure here: if the
+                // socket is already broken the original
+                // chunk-validation error is still the more useful
+                // diagnosis for the caller.
+                let _ = writer.flush().await;
+                return Err(std::io::Error::other(format!(
+                    "range-parallel-stream chunk failure: {}",
+                    reason
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Glue between probe response + chunk stream + writer. Composes
+/// `assemble_200_head` (builds a synthetic 200 with
+/// `Content-Length: total`), the caller's head-transform closure
+/// (e.g. CORS injection), and `stream_chunks_to_writer` (writes the
+/// transformed head, the probe body, then each chunk in order).
+///
+/// Extracted as a free function so the streaming-branch wiring in
+/// `do_relay_parallel_range_to` is unit-testable without a live
+/// `DomainFronter`. A test can feed a synthetic probe-header set, a
+/// probe body, and a `stream::iter(…)` of canned chunk results, then
+/// inspect the bytes written to a `Vec<u8>` to assert the right
+/// composition (head → probe → chunks in order, transform_head
+/// applied to the head only, mid-stream Err propagation with the
+/// committed prefix intact).
+async fn stream_range_response_to<W, S, F>(
+    writer: &mut W,
+    probe_resp_headers: &[(String, String)],
+    probe_body: &[u8],
+    total: u64,
+    chunks_stream: S,
+    transform_head: &F,
+    url_for_log: &str,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    S: futures_util::Stream<Item = (u64, u64, Result<Vec<u8>, &'static str>)>,
+    F: Fn(&[u8]) -> Vec<u8>,
+{
+    let head = assemble_200_head(probe_resp_headers, total);
+    let head = transform_head(&head);
+    stream_chunks_to_writer(writer, &head, probe_body, total, chunks_stream, url_for_log).await
+}
+
+/// Tiny adapter that lets `relay_parallel_range_to` write into a
+/// `Vec<u8>` so the backward-compat `relay_parallel_range` wrapper
+/// can stay on the writer-based code path. `Vec<u8>` itself doesn't
+/// implement `tokio::io::AsyncWrite`; this just extends in-place,
+/// never fails, and never needs to block — `poll_*` immediately
+/// returns `Ready`.
+struct VecAsyncWriter<'a>(&'a mut Vec<u8>);
+
+impl tokio::io::AsyncWrite for VecAsyncWriter<'_> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.get_mut().0.extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+fn normalize_x_graphql_url(url: &str) -> String {
+    // Split host from the rest. We accept both "x.com" and common legacy
+    // forms; the Python patch only checks x.com so we do the same to be
+    // safe about the endpoint actually accepting truncated requests.
+    let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) else {
+        return url.to_string();
+    };
+    let Some(slash) = rest.find('/') else {
+        return url.to_string();
+    };
+    let host = &rest[..slash];
+    let path_and_query = &rest[slash..];
+
+    // Strip port if present in host.
+    let host_no_port = host.split(':').next().unwrap_or(host);
+    if host_no_port != "x.com" {
+        return url.to_string();
+    }
+
+    let Some(q_idx) = path_and_query.find('?') else {
+        return url.to_string();
+    };
+    let path = &path_and_query[..q_idx];
+    let query = &path_and_query[q_idx + 1..];
+
+    if !path.starts_with("/i/api/graphql/") || !query.starts_with("variables=") {
+        return url.to_string();
+    }
+
+    let new_query = match query.find('&') {
+        Some(amp) => &query[..amp],
+        None => query,
+    };
+    let scheme = if url.starts_with("https://") { "https://" } else { "http://" };
+    format!("{}{}{}?{}", scheme, host, path, new_query)
+}
+
+/// Maximum bytes of random padding appended to outbound Apps Script
+/// JSON request bodies. Picked so the per-request padding distribution
+/// (uniformly 0..MAX) shifts the body length enough to defeat naive
+/// length-fingerprint DPI without bloating bandwidth — at the average
+/// 512-byte add, on a typical 2 KB tunnel batch this is +25%, which is
+/// negligible compared to Apps Script's per-call latency floor anyway.
+/// (Issue #313, #365 Section 1 — DPI evasion.)
+const MAX_RANDOM_PAD_BYTES: usize = 1024;
+
+/// Insert a `_pad` field of random length (0..MAX_RANDOM_PAD_BYTES)
+/// into a request payload before serialization. Server-side ignores
+/// unknown JSON fields, so this is fully backward-compatible with old
+/// `Code.gs` / `CodeFull.gs` deployments — the pad is just along for
+/// the ride.
+///
+/// Random bytes are base64-encoded (NO inner JSON-escape worries) and
+/// the pad LENGTH itself is uniformly distributed, so packet sizes
+/// land all over the place rather than clustering at a few discrete
+/// peaks. That's the property DPI's length-distribution clustering
+/// fingerprints can't match.
+fn add_random_pad(map: &mut serde_json::Map<String, Value>) {
+    let mut rng = thread_rng();
+    let len = rng.gen_range(0..=MAX_RANDOM_PAD_BYTES);
+    if len == 0 {
+        // Skip the field entirely sometimes — adds another bit of
+        // distribution variance (presence-vs-absence of `_pad` itself).
+        return;
+    }
+    let mut buf = vec![0u8; len];
+    rng.fill_bytes(&mut buf);
+    map.insert("_pad".into(), Value::String(B64.encode(&buf)));
+}
+
+/// "YYYY-MM-DD" of the current Pacific Time date. Used as the daily-reset
+/// boundary for `today_calls` / `today_bytes` because **Apps Script's
+/// quota counter resets at midnight Pacific Time, not UTC** — that's
+/// where Google's quota bookkeeping lives. We format manually so this
+/// stays std-only and doesn't pull `time-tz` or `chrono` plus a ~3 MB
+/// IANA tzdb just for one ~50-line helper. (Issue #230, #362.)
+///
+/// PT offset depends on DST: PST = UTC-8, PDT = UTC-7. We use the
+/// stable US DST rule (2nd Sunday of March 02:00 → 1st Sunday of
+/// November 02:00 = PDT, otherwise PST). The hour-of-day boundary on
+/// transition days is approximated; this drifts by up to 1h for at
+/// most 2h/year on the spring-forward / fall-back transitions, which
+/// is fine for a daily countdown.
+fn current_pt_day_key() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pt_secs = unix_to_pt_seconds(secs);
+    let (y, m, d) = unix_to_ymd_utc(pt_secs);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// Seconds until the next 00:00 Pacific Time. Used by the UI to render
+/// a "resets in Xh Ym" countdown matching Apps Script's actual quota
+/// reset cadence (#230, #362). Conservative: if the system clock is
+/// broken we return 0 instead of a huge negative-looking number.
+fn seconds_until_pacific_midnight() -> u64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pt_secs = unix_to_pt_seconds(secs);
+    let day = 86_400u64;
+    let rem = pt_secs % day;
+    if rem == 0 {
+        day
+    } else {
+        day - rem
+    }
+}
+
+/// Convert Unix UTC seconds to "Pacific Time as if it were UTC" seconds,
+/// i.e. add the PT-from-UTC offset (negative for the western hemisphere
+/// becomes a subtraction). Result is suitable for feeding into
+/// `unix_to_ymd_utc` to extract the PT calendar date, or for `% 86_400`
+/// to find PT seconds-into-day.
+fn unix_to_pt_seconds(utc_secs: u64) -> u64 {
+    // First-pass guess at PT date using PST (-8) — used to determine
+    // whether DST is currently in effect, which then settles the actual
+    // offset. The two-pass approach avoids the chicken-and-egg of
+    // "I need the PT date to know if it's DST, but I need the offset
+    // to compute the PT date." A 1-hour fudge in the guess is harmless
+    // because DST never starts within the first hour after midnight
+    // PST or ends within the first hour after midnight PDT.
+    let pst_guess = utc_secs.saturating_sub(8 * 3600);
+    let (y, m, d) = unix_to_ymd_utc(pst_guess);
+    let offset_secs = if pacific_is_dst(y, m, d) {
+        7 * 3600
+    } else {
+        8 * 3600
+    };
+    utc_secs.saturating_sub(offset_secs)
+}
+
+/// Whether Pacific Time is observing daylight saving on the given
+/// calendar date (year, month=1..12, day=1..31). US DST window:
+/// 2nd Sunday of March through 1st Sunday of November. The transition
+/// hour itself (02:00 local) is approximated to whole-day boundaries —
+/// good enough for a daily-quota countdown.
+fn pacific_is_dst(year: i64, month: u32, day: u32) -> bool {
+    if month < 3 || month > 11 {
+        return false;
+    }
+    if month > 3 && month < 11 {
+        return true;
+    }
+    if month == 3 {
+        let dst_start = nth_sunday_of_month(year, 3, 2);
+        day >= dst_start
+    } else {
+        // month == 11
+        let dst_end = nth_sunday_of_month(year, 11, 1);
+        day < dst_end
+    }
+}
+
+/// Day-of-month for the Nth Sunday (1-indexed) of (year, month). Uses
+/// Sakamoto's method for the month's-1st day-of-week, then offsets to
+/// the desired Sunday. Pure arithmetic, no calendar tables.
+fn nth_sunday_of_month(year: i64, month: u32, nth: u32) -> u32 {
+    // Sakamoto's day-of-week. 0 = Sunday.
+    static T: [i64; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = if month < 3 { year - 1 } else { year };
+    let m = month as i64;
+    let dow_of_1st =
+        ((y + y / 4 - y / 100 + y / 400 + T[(m - 1) as usize] + 1).rem_euclid(7)) as u32;
+    let first_sunday = if dow_of_1st == 0 { 1 } else { 8 - dow_of_1st };
+    first_sunday + (nth - 1) * 7
+}
+
+/// Convert a Unix timestamp (seconds since 1970-01-01 UTC) to a
+/// (year, month, day) tuple, UTC. Standalone so we can stay
+/// std-only — no chrono/time/jiff dependency pulled for one caller.
+///
+/// Algorithm: Howard Hinnant's civil_from_days, widely cited and
+/// simple enough to audit by eye. Works for years 1970–9999 which
+/// we'll outlive.
+fn unix_to_ymd_utc(secs: u64) -> (i64, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    // Shift so day 0 is 0000-03-01 (Hinnant's era-based trick).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
+}
+
+/// Parse the exit-node JSON envelope back into a raw HTTP/1.1
+/// response. The envelope shape is:
+///
+/// - On success: `{ "s": <status u16>, "h": { ... }, "b": "<base64>" }`
+/// - On exit-node-side error: `{ "e": "<message>" }` with HTTP 4xx/5xx
+///   from exit-node's own status code (decoded from the outer Apps Script
+///   layer, not the inner field).
+///
+/// We synthesize a complete HTTP/1.1 response from these fields so the
+/// MITM TLS write-back path sees the same shape it gets from the regular
+/// Apps Script relay (status line + headers + body).
+fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
+    let json_start = body
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(0);
+    let json_bytes = &body[json_start..];
+    let v: Value = serde_json::from_slice(json_bytes).map_err(|e| {
+        FronterError::Relay(format!(
+            "exit-node response not valid JSON ({}): {}",
+            e,
+            String::from_utf8_lossy(&json_bytes[..json_bytes.len().min(200)])
+        ))
+    })?;
+
+    // Surface exit-node's internal errors clearly rather than as a 502
+    // from the outer envelope. The `{e: "..."}` shape is what the exit-node's
+    // script emits on bad PSK, malformed URL, or any caught exception.
+    if let Some(err_msg) = v.get("e").and_then(|x| x.as_str()) {
+        return Err(FronterError::Relay(format!(
+            "exit node refused or errored: {}",
+            err_msg
+        )));
+    }
+
+    let status = v
+        .get("s")
+        .and_then(|x| x.as_u64())
+        .map(|n| n as u16)
+        .unwrap_or(502);
+    let body_b64 = v.get("b").and_then(|x| x.as_str()).unwrap_or("");
+    let body_bytes = if body_b64.is_empty() {
+        Vec::new()
+    } else {
+        B64.decode(body_b64).map_err(|e| {
+            FronterError::Relay(format!("exit-node body base64 decode failed: {}", e))
+        })?
+    };
+
+    // Reconstruct headers. Skip hop-by-hop / would-double-up headers
+    // (Content-Length comes from our own length count below; the outer
+    // Apps Script transport already handled Transfer-Encoding/chunked).
+    const SKIP_RESPONSE_HEADERS: &[&str] = &[
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "content-encoding", // exit node's fetch() auto-decompresses; header is stale
+    ];
+
+    let mut out = Vec::with_capacity(body_bytes.len() + 256);
+    let _ = std::io::Write::write_fmt(
+        &mut out,
+        format_args!("HTTP/1.1 {} {}\r\n", status, status_reason(status)),
+    );
+    if let Some(headers_obj) = v.get("h").and_then(|x| x.as_object()) {
+        for (k, v_val) in headers_obj {
+            let lc = k.to_ascii_lowercase();
+            if SKIP_RESPONSE_HEADERS.contains(&lc.as_str()) {
+                continue;
+            }
+            if let Some(val_str) = v_val.as_str() {
+                let _ = std::io::Write::write_fmt(
+                    &mut out,
+                    format_args!("{}: {}\r\n", k, val_str),
+                );
+            }
+        }
+    }
+    let _ = std::io::Write::write_fmt(
+        &mut out,
+        format_args!("Content-Length: {}\r\n\r\n", body_bytes.len()),
+    );
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+/// Minimal HTTP status reason-phrase table for synthesizing status
+/// lines in `parse_exit_node_response`. Browsers don't actually parse
+/// the reason phrase (only the status code matters), but a recognizable
+/// string makes log lines readable.
+fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Status",
+    }
+}
+
+fn extract_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    // Strip userinfo if present.
+    let authority = authority.rsplit_once('@').map(|(_, a)| a).unwrap_or(authority);
+    // Strip port. Handle IPv6 literals in brackets.
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // [::1]:443 -> ::1
+        stripped.split_once(']').map(|(h, _)| h).unwrap_or(stripped)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// The default pool of SNI names that share the Google Front End with
+/// `www.google.com`. Used both when auto-expanding from `front_domain` and
+/// when the UI wants to show the starting candidates for the SNI editor.
+pub const DEFAULT_GOOGLE_SNI_POOL: &[&str] = &[
+    "www.google.com",
+    "mail.google.com",
+    "drive.google.com",
+    "docs.google.com",
+    "calendar.google.com",
+    // accounts.google.com — standard Google account service, covered by
+    // the *.google.com wildcard cert. Previously listed as
+    // accounts.googl.com (issue #42), but googl.com is NOT in the SAN
+    // list of Google's GFE certificate — connections with verify_ssl=true
+    // fail with "certificate not valid for name" when the round-robin
+    // lands on it.
+    "accounts.google.com",
+    // scholar.google.com — reported
+    // in #47 as a DPI-passing SNI on MCI / Samantel. Covered by the
+    // core *.google.com cert so it handshakes normally against
+    // google_ip:443.
+    "scholar.google.com",
+    // Additional Google properties for rotation. Ported from upstream
+    // Python `FRONT_SNI_POOL_GOOGLE` (masterking32/MasterHttpRelayVPN
+    // commit 57738ec, "Add additional Google services to exclusion
+    // lists"). All served off the same GFE IP range, all covered by the
+    // wildcard cert, all give the DPI-fingerprint spread without extra
+    // config. A few of these (maps.google.com, play.google.com) reliably
+    // pass DPI on carriers where the shorter `*.google.com` names don't.
+    "maps.google.com",
+    "chat.google.com",
+    "translate.google.com",
+    "play.google.com",
+    "lens.google.com",
+    // chromewebstore.google.com — reported in issue #75 as a working
+    // SNI. Same family as the rest: wildcard cert, GFE-hosted,
+    // handshake against google_ip:443 with no content negotiation.
+    "chromewebstore.google.com",
+];
+
+/// Build the pool of SNI hosts used for outbound connections to the Google
+/// edge.
+///
+/// Precedence:
+/// 1. If `user_pool` is non-empty, use it verbatim (user is in charge).
+/// 2. If `primary` is one of the DEFAULT_GOOGLE_SNI_POOL entries, auto-expand
+///    to the full default list with `primary` first. This gives the per-SNI
+///    connection-count fingerprint spread without the user configuring
+///    anything.
+/// 3. Otherwise — custom / non-Google `primary` — use just `[primary]`, since
+///    we have no way to verify which sibling names share a non-Google edge.
+///
+/// All entries MUST be hosted on the same edge as `connect_host`, otherwise
+/// the TLS handshake will land on the wrong server.
+pub fn build_sni_pool_for(primary: &str, user_pool: &[String]) -> Vec<String> {
+    let primary = primary.trim().to_string();
+    let user_filtered: Vec<String> = user_pool
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !user_filtered.is_empty() {
+        return user_filtered;
+    }
+
+    let looks_like_google_edge = DEFAULT_GOOGLE_SNI_POOL.iter().any(|s| *s == primary);
+    let mut pool = vec![primary.clone()];
+    if looks_like_google_edge {
+        for s in DEFAULT_GOOGLE_SNI_POOL {
+            if *s != primary {
+                pool.push((*s).to_string());
+            }
+        }
+    }
+    pool
+}
+
+/// Back-compat thin wrapper for the old callers / tests.
+fn build_sni_pool(primary: &str) -> Vec<String> {
+    build_sni_pool_for(primary, &[])
+}
+
+pub fn filter_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    const SKIP: &[&str] = &[
+        // Hop-by-hop / framing — must not be forwarded across the proxy.
+        "host",
+        "connection",
+        "content-length",
+        "transfer-encoding",
+        "proxy-connection",
+        "proxy-authorization",
+        // Identity-revealing forwarding headers (issue #104).
+        // If the user sits behind another proxy or uses a browser
+        // extension that inserts any of these, they'd normally carry
+        // the client's real IP. We strip every known variant so the
+        // origin server only ever sees whatever source IP the Apps
+        // Script or GFE path terminates on — never the user's home IP.
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-forwarded-server",
+        "x-forwarded-ssl",
+        "forwarded",
+        "via",
+        "x-real-ip",
+        "x-client-ip",
+        "x-originating-ip",
+        "true-client-ip",
+        "cf-connecting-ip",
+        "fastly-client-ip",
+        "x-cluster-client-ip",
+        "client-ip",
+    ];
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            let lk = k.to_ascii_lowercase();
+            if SKIP.contains(&lk.as_str()) {
+                return None;
+            }
+            if lk == "accept-encoding" {
+                let cleaned = strip_brotli_from_accept_encoding(v);
+                if cleaned.is_empty() {
+                    return None;
+                }
+                return Some((k.clone(), cleaned));
+            }
+            Some((k.clone(), v.clone()))
+        })
+        .collect()
+}
+
+fn strip_brotli_from_accept_encoding(value: &str) -> String {
+    let parts: Vec<&str> = value.split(',').map(str::trim).collect();
+    let kept: Vec<&str> = parts
+        .into_iter()
+        .filter(|p| {
+            let tok = p.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            tok != "br" && tok != "zstd"
+        })
+        .collect();
+    kept.join(", ")
+}
+
+fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+fn header_get(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+}
+
+fn parse_redirect(location: &str) -> (String, Option<String>) {
+    // Absolute URL: http(s)://host/path?query
+    if let Some(rest) = location.strip_prefix("https://").or_else(|| location.strip_prefix("http://")) {
+        let slash = rest.find('/').unwrap_or(rest.len());
+        let host = rest[..slash].to_string();
+        let path = if slash < rest.len() { rest[slash..].to_string() } else { "/".into() };
+        return (path, Some(host));
+    }
+    // Relative path.
+    (location.to_string(), None)
+}
+
+/// Read a single HTTP/1.1 response from the stream. Keep-alive safe: respects
+/// Content-Length or chunked transfer-encoding.
+///
+/// Uses a 10 s *total* header-read deadline — the historical 10 s value
+/// preserved for most callers (relay path, exit-node, etc.). Note the
+/// semantics changed in this patch: the underlying loop now treats this
+/// as an absolute deadline across all header reads, not a per-read budget
+/// that would silently extend on drip-feed. The tunnel batch path overrides
+/// the 10 s value via `read_http_response_with_header_timeout`, since the
+/// configurable `request_timeout_secs` (default 30 s) is the authoritative
+/// cliff there.
+async fn read_http_response<S>(stream: &mut S) -> Result<(u16, Vec<(String, String)>, Vec<u8>), FronterError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    read_http_response_with_header_timeout(stream, Duration::from_secs(10)).await
+}
+
+/// `read_http_response` with a caller-supplied header-read timeout. The
+/// timeout applies only to the *initial* header-block read; the body-read
+/// timeouts in this function are deliberately left at their fixed values
+/// because once the response has started flowing, per-chunk stalls are a
+/// separate signal from "Apps Script hasn't started writing yet."
+///
+/// The tunnel batch path passes `DomainFronter::batch_timeout()` so that
+/// `Config::request_timeout_secs` is the *only* knob controlling how long
+/// we wait for an Apps Script edge to start responding — the hardcoded 10 s
+/// inner cliff was firing well before the outer `batch_timeout` in
+/// `tunnel_client::fire_batch` could, masquerading as a 10 s "batch
+/// timeout" in user logs (issue #1088).
+async fn read_http_response_with_header_timeout<S>(
+    stream: &mut S,
+    header_read_timeout: Duration,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), FronterError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 8192];
+    // One deadline for the whole header read, not per-iteration. Otherwise
+    // a slow peer drip-feeding one byte just under `header_read_timeout`
+    // keeps this loop alive forever and defeats the outer `batch_timeout`
+    // wiring (the entire point of #1088's fix).
+    let deadline = tokio::time::Instant::now() + header_read_timeout;
+    let header_end = loop {
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut tmp)).await
+            .map_err(|_| FronterError::Timeout)??;
+        if n == 0 {
+            return Err(FronterError::BadResponse("connection closed before headers".into()));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_double_crlf(&buf) {
+            break pos;
+        }
+        if buf.len() > 1024 * 1024 {
+            return Err(FronterError::BadResponse("headers too large".into()));
+        }
+    };
+
+    let header_section = &buf[..header_end];
+    let header_str = std::str::from_utf8(header_section)
+        .map_err(|_| FronterError::BadResponse("non-utf8 headers".into()))?;
+    let mut lines = header_str.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let status = parse_status_line(status_line)?;
+
+    let mut headers_out: Vec<(String, String)> = Vec::new();
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            headers_out.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+
+    let mut body = buf[header_end + 4..].to_vec();
+    let content_length: Option<usize> = header_get(&headers_out, "content-length")
+        .and_then(|v| v.parse().ok());
+    let te = header_get(&headers_out, "transfer-encoding").unwrap_or_default();
+    let is_chunked = te.to_ascii_lowercase().contains("chunked");
+
+    if is_chunked {
+        body = read_chunked(stream, body).await?;
+    } else if let Some(cl) = content_length {
+        while body.len() < cl {
+            let need = cl - body.len();
+            let want = need.min(tmp.len());
+            // Handle ungraceful TLS close-without-close_notify (rustls
+            // surfaces this as `io::ErrorKind::UnexpectedEof`). Some
+            // origins — notably exit-node path through Apps
+            // Script (#585, v1.9.4) and certain Apps Script `Connection:
+            // close` responses — terminate the underlying TCP without
+            // sending the TLS close_notify alert first. Treat that the
+            // same as a clean `n == 0`: if we already have the full body
+            // declared by Content-Length, the response *is* complete.
+            // Only propagate the error if Content-Length couldn't be
+            // satisfied (real truncation, not a polite-protocol violation).
+            let read_res = timeout(
+                Duration::from_secs(20),
+                stream.read(&mut tmp[..want]),
+            )
+            .await
+            .map_err(|_| FronterError::Timeout)?;
+            let n = match read_res {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                Err(e) => return Err(e.into()),
+            };
+            if n == 0 {
+                return Err(FronterError::BadResponse(
+                    "connection closed before full response body".into(),
+                ));
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+    } else {
+        // No framing — read until short timeout, EOF, or ungraceful
+        // TLS close (UnexpectedEof). Each is treated as "we got what
+        // the peer wanted to send"; the response we already have is
+        // returned to the caller. UnexpectedEof here is the most common
+        // case for `Connection: close` responses from servers that
+        // don't bother with TLS close_notify (#585).
+        loop {
+            match timeout(Duration::from_secs(2), stream.read(&mut tmp)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => break,
+            }
+        }
+    }
+
+    // gzip decompress if content-encoding says so.
+    if let Some(enc) = header_get(&headers_out, "content-encoding") {
+        if enc.eq_ignore_ascii_case("gzip") {
+            if let Ok(decoded) = decode_gzip(&body) {
+                body = decoded;
+            }
+        }
+    }
+
+    Ok((status, headers_out, body))
+}
+
+async fn read_chunked<S>(stream: &mut S, mut buf: Vec<u8>) -> Result<Vec<u8>, FronterError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 16384];
+    loop {
+        let size_line_owned = std::str::from_utf8(&read_crlf_line(stream, &mut buf, &mut tmp).await?)
+            .map_err(|_| FronterError::BadResponse("bad chunk size".into()))?
+            .trim()
+            .to_string();
+        if size_line_owned.is_empty() {
+            continue;
+        }
+        let size = usize::from_str_radix(
+            size_line_owned.split(';').next().unwrap_or(""),
+            16,
+        )
+        .map_err(|_| FronterError::BadResponse(format!("bad chunk size '{}'", size_line_owned)))?;
+        if size == 0 {
+            loop {
+                if read_crlf_line(stream, &mut buf, &mut tmp).await?.is_empty() {
+                    return Ok(out);
+                }
+            }
+        }
+        while buf.len() < size + 2 {
+            // UnexpectedEof tolerance — see read_http_response for
+            // rationale. Treated as `n == 0`; if we haven't accumulated
+            // the full chunk yet, that's still a real truncation and
+            // we return BadResponse below.
+            let read_res = timeout(Duration::from_secs(20), stream.read(&mut tmp))
+                .await
+                .map_err(|_| FronterError::Timeout)?;
+            let n = match read_res {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                Err(e) => return Err(e.into()),
+            };
+            if n == 0 {
+                return Err(FronterError::BadResponse(
+                    "connection closed mid-chunked response".into(),
+                ));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        if &buf[size..size + 2] != b"\r\n" {
+            return Err(FronterError::BadResponse(
+                "chunk missing trailing CRLF".into(),
+            ));
+        }
+        out.extend_from_slice(&buf[..size]);
+        buf.drain(..size + 2);
+    }
+}
+
+async fn read_crlf_line<S>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    tmp: &mut [u8],
+) -> Result<Vec<u8>, FronterError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        if let Some(idx) = buf.windows(2).position(|w| w == b"\r\n") {
+            let line = buf[..idx].to_vec();
+            buf.drain(..idx + 2);
+            return Ok(line);
+        }
+        let n = timeout(Duration::from_secs(20), stream.read(tmp)).await
+            .map_err(|_| FronterError::Timeout)??;
+        if n == 0 {
+            return Err(FronterError::BadResponse(
+                "connection closed mid-chunked response".into(),
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+fn decode_gzip(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    let mut out = Vec::with_capacity(data.len() * 2);
+    flate2::read::GzDecoder::new(data).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_status_line(line: &str) -> Result<u16, FronterError> {
+    // "HTTP/1.1 200 OK"
+    let mut parts = line.split_whitespace();
+    let _version = parts.next();
+    let code = parts.next().ok_or_else(|| {
+        FronterError::BadResponse(format!("bad status line: {}", line))
+    })?;
+    code.parse::<u16>().map_err(|_| FronterError::BadResponse(format!("bad status code: {}", code)))
+}
+
+/// Returns `true` if the HTTP method is safe to fan-out across multiple
+/// Apps Script deployments (i.e. idempotent per RFC 9110 §9.2.2). Used
+/// by `do_relay_with_retry` to gate the `parallel_relay` fan-out so that
+/// non-idempotent operations (POST / PUT / PATCH / DELETE) don't double-
+/// fire at the destination — Apps Script `UrlFetchApp.fetch()` can't be
+/// cancelled mid-request from our side, so every parallel attempt
+/// completes server-side even when our `select_ok` already returned a
+/// winner. See #743 for the user-visible bug (duplicate POSTs).
+fn is_method_safe_for_fanout(method: &str) -> bool {
+    matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS")
+}
+
+/// Recognize HTTP statuses from the h2 path that mean "this edge
+/// won't accept your fronted h2 request, but might accept the same
+/// request over h1." Used to trigger an automatic sticky-disable of
+/// the h2 fast path + h1 fallback.
+///
+/// 421 (Misdirected Request) is the spec signal: per RFC 7540
+/// §9.1.2, the server returns it when the connection's authority is
+/// not appropriate for the request URI. With domain fronting that
+/// means the edge enforced "TLS SNI must match :authority" — true
+/// on h2 (the server sees both pseudo-headers in cleartext) but
+/// historically lenient on h1 (the encrypted Host header is what
+/// the bypass relies on). Treating 421 as h2-fallback rather than
+/// "Apps Script error" prevents h2 default-on from breaking
+/// previously-working h1 deployments.
+///
+/// Other edge-level rejects (403, etc.) are ambiguous — could be a
+/// real Apps Script geoblock or a real upstream — so we don't
+/// blanket-treat them.
+///
+/// The h2 layer treats this as a "request not sent upstream"
+/// outcome (the edge rejected before forwarding to Apps Script),
+/// so falling back to h1 is safe with no duplication risk.
+fn is_h2_fronting_refusal_status(status: u16) -> bool {
+    status == 421
+}
+
+/// CDN metadata headers that carry no value through a MITM relay.
+/// Stripped when `strip_noise_response_headers = true` (the default).
+/// The browser never reads them through a proxy, and they add 400-700 bytes
+/// of JSON per CDN-backed response for zero benefit.
+static NOISE_RESPONSE_HEADERS: &[&str] = &[
+    "report-to",
+    "reporting-endpoints",
+    "nel",
+    "alt-svc",
+    "server-timing",
+    "origin-trial",
+    "cf-ray",
+    "cf-cache-status",
+    "x-amzn-requestid",
+    "x-amzn-trace-id",
+    "x-request-id",
+    "x-correlation-id",
+];
+
+/// Parse the JSON envelope from Apps Script and build a raw HTTP response.
+fn parse_relay_json(body: &[u8], strip_noise: bool) -> Result<Vec<u8>, FronterError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| FronterError::BadResponse("non-utf8 json".into()))?
+        .trim();
+    if text.is_empty() {
+        return Err(FronterError::BadResponse("empty relay body".into()));
+    }
+
+    let data: RelayResponse = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => {
+            // Some deployments (legacy Code.gs that used HtmlService for
+            // _json, or our own doGet hit accidentally via a redirect
+            // chain) wrap the JSON inside the goog.script sandbox iframe
+            // as `goog.script.init("\x7b...userHtml...\x7d", "", undefined)`.
+            // Try that unwrap first — if it succeeds, the inner userHtml
+            // *is* our JSON. Mirrors upstream's Python client extractor.
+            if let Some(unwrapped) = extract_apps_script_user_html(text) {
+                if let Ok(v) = serde_json::from_str(&unwrapped) {
+                    v
+                } else {
+                    return Err(FronterError::BadResponse(format!(
+                        "no json in apps_script user_html: {}",
+                        &unwrapped[..unwrapped.len().min(200)]
+                    )));
+                }
+            } else {
+                // Last resort: extract first { ... last }, in case Apps
+                // Script prepended HTML preamble before the raw JSON.
+                let start = text.find('{').ok_or_else(|| {
+                    FronterError::BadResponse(format!(
+                        "no json in: {}",
+                        &text.chars().take(200).collect::<String>()
+                    ))
+                })?;
+                let end = text.rfind('}').ok_or_else(|| {
+                    FronterError::BadResponse(format!(
+                        "no json end in: {}",
+                        &text.chars().take(200).collect::<String>()
+                    ))
+                })?;
+                if start > end {
+                    return Err(FronterError::BadResponse(format!(
+                        "no valid json object in: {}",
+                        &text.chars().take(200).collect::<String>()
+                    )));
+                }
+                serde_json::from_str(&text[start..=end])?
+            }
+        }
+    };
+
+    if let Some(e) = data.e {
+        return Err(FronterError::Relay(e));
+    }
+
+    let status = data.s.unwrap_or(200);
+    let status_text = status_text(status);
+    let resp_body = match data.b {
+        Some(b) => B64
+            .decode(b)
+            .map_err(|e| FronterError::BadResponse(format!("bad relay body base64: {}", e)))?,
+        None => Vec::new(),
+    };
+
+    let mut out = Vec::with_capacity(resp_body.len() + 256);
+    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status, status_text).as_bytes());
+
+    const SKIP: &[&str] = &[
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "content-length",
+        "content-encoding",
+    ];
+
+    if let Some(hmap) = data.h {
+        for (k, v) in hmap {
+            let lk = k.to_ascii_lowercase();
+            if SKIP.contains(&lk.as_str()) {
+                continue;
+            }
+            if strip_noise && NOISE_RESPONSE_HEADERS.contains(&lk.as_str()) {
+                continue;
+            }
+            match v {
+                Value::Array(arr) => {
+                    for item in arr {
+                        if let Some(s) = value_to_header_str(&item) {
+                            out.extend_from_slice(format!("{}: {}\r\n", k, s).as_bytes());
+                        }
+                    }
+                }
+                other => {
+                    if let Some(s) = value_to_header_str(&other) {
+                        out.extend_from_slice(format!("{}: {}\r\n", k, s).as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", resp_body.len()).as_bytes());
+    out.extend_from_slice(&resp_body);
+    Ok(out)
+}
+
+/// Unwrap the `goog.script.init` sandbox iframe that wraps every
+/// HtmlService web-app response. The wrapper text looks roughly like:
+///
+/// ```text
+/// <html>...
+/// goog.script.init("\x7b\x22userHtml\x22:\x22{...}\x22,...\x7d", "", undefined);
+/// ...
+/// ```
+///
+/// where the first parameter is a JSON string (with `\xNN` byte-escapes
+/// for `{`, `"`, etc.) whose `userHtml` field carries our actual JSON
+/// body. We find the marker, decode the byte-escapes, parse the outer
+/// JSON, and return `userHtml`. Returns `None` if any step doesn't
+/// match — the caller falls back to the brace-scan path.
+///
+/// Mirrors `_extract_apps_script_user_html` in upstream Python client.
+fn extract_apps_script_user_html(text: &str) -> Option<String> {
+    let marker = "goog.script.init(\"";
+    let start_idx = text.find(marker)? + marker.len();
+    // The marker is closed by `", "", undefined` (Apps Script always
+    // emits this exact literal — there are two more positional args after
+    // the JSON string, both empty / undefined).
+    let end_marker = "\", \"\", undefined";
+    let end_idx = text[start_idx..].find(end_marker)? + start_idx;
+    let encoded = &text[start_idx..end_idx];
+
+    // Decode `\xNN` and `\u00NN` byte-escapes that Apps Script uses to
+    // protect `{`, `"`, `\`, etc. inside the JS string literal.
+    let decoded = decode_js_string_escapes(encoded)?;
+
+    // Outer JSON — typically `{"userHtml":"<our JSON>", ...}`.
+    let outer: Value = serde_json::from_str(&decoded).ok()?;
+    let user_html = outer.get("userHtml")?.as_str()?;
+    Some(user_html.to_string())
+}
+
+/// Minimal JS string-literal escape decoder for `\xNN`, `\uNNNN`, and
+/// the standard backslash forms (`\\`, `\"`, `\n`, `\r`, `\t`, `\/`).
+/// Used to unwrap the `goog.script.init("...")` parameter — Apps Script
+/// emits ASCII-only `\xNN` for every non-alphanumeric byte, so the
+/// decoder doesn't need to handle full Unicode surrogates.
+fn decode_js_string_escapes(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c != b'\\' {
+            // Fast path: copy ASCII / valid UTF-8 byte through.
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            return None;
+        }
+        let esc = bytes[i + 1];
+        match esc {
+            b'x' => {
+                if i + 3 >= bytes.len() {
+                    return None;
+                }
+                let hex = std::str::from_utf8(&bytes[i + 2..i + 4]).ok()?;
+                let v = u8::from_str_radix(hex, 16).ok()?;
+                out.push(v as char);
+                i += 4;
+            }
+            b'u' => {
+                if i + 5 >= bytes.len() {
+                    return None;
+                }
+                let hex = std::str::from_utf8(&bytes[i + 2..i + 6]).ok()?;
+                let v = u32::from_str_radix(hex, 16).ok()?;
+                let ch = char::from_u32(v)?;
+                out.push(ch);
+                i += 6;
+            }
+            b'\\' => { out.push('\\'); i += 2; }
+            b'"' => { out.push('"'); i += 2; }
+            b'\'' => { out.push('\''); i += 2; }
+            b'/' => { out.push('/'); i += 2; }
+            b'n' => { out.push('\n'); i += 2; }
+            b'r' => { out.push('\r'); i += 2; }
+            b't' => { out.push('\t'); i += 2; }
+            b'b' => { out.push('\x08'); i += 2; }
+            b'f' => { out.push('\x0c'); i += 2; }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+#[derive(Debug, Clone)]
+pub struct StatsSnapshot {
+    /// Total relay() calls today (exit node + Apps Script). Sourced from the
+    /// persisted quota tracker so this survives proxy restarts.
+    pub total_relay_calls: u64,
+    pub relay_calls: u64,
+    pub relay_failures: u64,
+    pub coalesced: u64,
+    pub bytes_relayed: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_bytes: usize,
+    pub blacklisted_scripts: usize,
+    pub total_scripts: usize,
+    /// Relay calls attributed to the current Pacific Time day. Resets
+    /// at 00:00 PT (midnight Pacific) — matches Apps Script's actual
+    /// quota reset cadence (#230, #362). This is what-this-process-
+    /// has-done today, not the Google-side bucket.
+    pub today_calls: u64,
+    /// Response bytes from relay calls attributed to the current PT day.
+    pub today_bytes: u64,
+    /// "YYYY-MM-DD" of the PT day `today_calls` / `today_bytes` refer
+    /// to. Useful for cross-referencing against Google's dashboard,
+    /// which is also PT-aligned.
+    pub today_key: String,
+    /// Seconds until the next 00:00 PT rollover. Convenient for the UI
+    /// to render "Resets in Xh Ym" without importing time libraries.
+    pub today_reset_secs: u64,
+    /// Calls served by the HTTP/2 multiplexed transport, across all
+    /// entry points (Apps-Script direct, exit-node outer call,
+    /// full-mode tunnel single op, full-mode tunnel batch).
+    ///
+    /// Not comparable to `relay_calls` — that counter only sees the
+    /// Apps-Script-direct path. To gauge h2 health, compute
+    /// `h2_calls / (h2_calls + h2_fallbacks)`.
+    pub h2_calls: u64,
+    /// Calls that attempted h2 but had to fall back to h1 (per-call
+    /// failures, open timeout, backoff, sticky ALPN refusal). Same
+    /// all-entry-points scope as `h2_calls`.
+    pub h2_fallbacks: u64,
+    /// True when h2 is permanently off for this fronter (config kill
+    /// switch set, or peer refused h2 during ALPN). All traffic on the
+    /// h1 path.
+    pub h2_disabled: bool,
+    /// Quota state snapshot. Only meaningful in AppsScript/Full modes where
+    /// a DomainFronter is active; defaults to zero values in Direct mode.
+    pub quota: QuotaSummary,
+}
+
+impl StatsSnapshot {
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 {
+            0.0
+        } else {
+            (self.cache_hits as f64 / total as f64) * 100.0
+        }
+    }
+
+    pub fn fmt_line(&self) -> String {
+        // h2 segment is the success ratio across all transports
+        // (h2_calls + h2_fallbacks). Showing "X/Y" against relay_calls
+        // would mislead — relay_calls only counts the Apps-Script
+        // direct path, while h2_calls also includes exit-node and
+        // tunnel paths that bypass relay_uncoalesced.
+        let h2_seg = if self.h2_disabled {
+            " h2=off".to_string()
+        } else {
+            let total = self.h2_calls + self.h2_fallbacks;
+            if total == 0 {
+                String::new()
+            } else {
+                let pct = (self.h2_calls as f64 / total as f64) * 100.0;
+                format!(
+                    " h2-success={}/{} ({:.0}%)",
+                    self.h2_calls, total, pct
+                )
+            }
+        };
+        let q = &self.quota;
+        let quota_seg = if q.account_count > 0 && (q.exhausted_count > 0 || q.global_hard_stop) {
+            format!(
+                " quota={}/{} remaining={} exhausted={}/{}{}",
+                q.requests_used_total,
+                q.daily_capacity_total,
+                q.requests_remaining_total,
+                q.exhausted_count,
+                q.account_count,
+                if q.global_hard_stop { " HARD-STOP" } else { "" },
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}{}",
+            self.relay_calls,
+            self.bytes_relayed / 1024,
+            self.relay_failures,
+            self.coalesced,
+            self.cache_hits,
+            self.cache_hits + self.cache_misses,
+            self.hit_rate(),
+            self.cache_bytes / 1024,
+            self.total_scripts - self.blacklisted_scripts,
+            self.total_scripts,
+            h2_seg,
+            quota_seg,
+        )
+    }
+
+    /// Hand-rolled JSON serialization so the Android side can read the
+    /// snapshot via JNI without pulling `serde_derive` through this struct.
+    /// Field names match the Rust side verbatim so Kotlin can `JSONObject`
+    /// parse them directly.
+    pub fn to_json(&self) -> String {
+        fn esc(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        }
+        let q = &self.quota;
+        format!(
+            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{},"quota_account_count":{},"quota_capacity":{},"quota_used":{},"quota_remaining":{},"quota_exhausted":{},"quota_hard_stop":{}}}"#,
+            self.relay_calls,
+            self.relay_failures,
+            self.coalesced,
+            self.bytes_relayed,
+            self.cache_hits,
+            self.cache_misses,
+            self.cache_bytes,
+            self.blacklisted_scripts,
+            self.total_scripts,
+            self.today_calls,
+            self.today_bytes,
+            esc(&self.today_key),
+            self.today_reset_secs,
+            self.h2_calls,
+            self.h2_fallbacks,
+            self.h2_disabled,
+            q.account_count,
+            q.daily_capacity_total,
+            q.requests_used_total,
+            q.requests_remaining_total,
+            q.exhausted_count,
+            q.global_hard_stop,
+        )
+    }
+}
+
+fn should_blacklist(status: u16, body: &str) -> bool {
+    if status == 429 || status == 403 {
+        return true;
+    }
+    looks_like_quota_error(body)
+}
+
+/// True only when the error is a Relay-level message that looks like a quota
+/// signal from Apps Script. Io/Tls/Timeout errors are local transport issues
+/// and must NOT trigger account exhaustion — that would false-stop accounts on
+/// any network glitch.
+fn is_quota_like_fronter_error(e: &FronterError) -> bool {
+    match e {
+        FronterError::Relay(msg) => looks_like_quota_error(msg),
+        FronterError::NonRetryable(inner) => is_quota_like_fronter_error(inner),
+        _ => false,
+    }
+}
+
+fn looks_like_quota_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("quota")
+        || lower.contains("daily limit")
+        || lower.contains("rate limit")
+        || lower.contains("too many times")
+        || lower.contains("service invoked")
+        || lower.contains("bandwidth")
+        || lower.contains("bandbreitenkontingent")
+        || lower.contains("datenübertragungsrate")
+        || lower.contains("transfer rate")
+        || lower.contains("limit exceeded")
+}
+
+fn mask_script_id(id: &str) -> String {
+    let n = id.chars().count();
+    if n <= 8 {
+        return "***".into();
+    }
+    let head: String = id.chars().take(4).collect();
+    let tail: String = id.chars().skip(n - 4).collect();
+    format!("{}...{}", head, tail)
+}
+
+fn value_to_header_str(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Null => None,
+        _ => None,
+    }
+}
+
+fn status_text(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        504 => "Gateway Timeout",
+        _ => "OK",
+    }
+}
+
+pub fn error_response(status: u16, message: &str) -> Vec<u8> {
+    let body = format!(
+        "<html><body><h1>{}</h1><p>{}</p></body></html>",
+        status,
+        html_escape(message)
+    );
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+        status,
+        status_text(status),
+        body.len()
+    );
+    let mut out = head.into_bytes();
+    out.extend_from_slice(body.as_bytes());
+    out
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+// Dangerous "accept anything" TLS verifier, used only when config.verify_ssl=false.
+#[derive(Debug)]
+struct NoVerify;
+
+impl ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{duplex, AsyncRead, AsyncWriteExt, ReadBuf};
+
+    // Test fixture for ungraceful TLS close: emit a fixed prefix of bytes
+    // then return io::ErrorKind::UnexpectedEof on the next read. Mirrors
+    // what rustls surfaces when the peer closes TCP without sending a
+    // TLS close_notify alert (#585).
+    struct UnexpectedEofAfter {
+        bytes: Vec<u8>,
+        position: usize,
+    }
+
+    impl AsyncRead for UnexpectedEofAfter {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.position >= self.bytes.len() {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed connection without sending TLS close_notify",
+                )));
+            }
+            let remaining = &self.bytes[self.position..];
+            let take = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..take]);
+            self.position += take;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_http_response_tolerates_unexpected_eof_with_content_length() {
+        // Issue #585 / v1.9.4 exit-node bug. Some peers (the deployed exit-node in
+        // particular, certain Apps Script `Connection: close` paths) close
+        // the TCP without TLS close_notify. Body should still be returned
+        // when Content-Length is satisfied, even though the read after
+        // the body closes ungracefully.
+        let body = b"{\"ok\":true}";
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut full = header.into_bytes();
+        full.extend_from_slice(body);
+        let mut stream = UnexpectedEofAfter {
+            bytes: full,
+            position: 0,
+        };
+
+        let (status, _headers, got_body) =
+            read_http_response(&mut stream).await.expect("must succeed despite UnexpectedEof");
+        assert_eq!(status, 200);
+        assert_eq!(got_body, body);
+    }
+
+    #[tokio::test]
+    async fn read_http_response_tolerates_unexpected_eof_no_framing() {
+        // Same #585 fix, but for the no-framing branch (server didn't
+        // send Content-Length or Transfer-Encoding). Read until peer
+        // closes — UnexpectedEof should terminate the loop with the
+        // body we accumulated so far, not bubble up as an error.
+        let header = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+        let body = b"hello world";
+        let mut full = header.to_vec();
+        full.extend_from_slice(body);
+        let mut stream = UnexpectedEofAfter {
+            bytes: full,
+            position: 0,
+        };
+
+        let (status, _headers, got_body) =
+            read_http_response(&mut stream).await.expect("must succeed despite UnexpectedEof");
+        assert_eq!(status, 200);
+        assert_eq!(got_body, body);
+    }
+
+    /// Issue #1088. The tunnel batch path passes `batch_timeout` (default
+    /// 30 s, configurable up to 300 s) to `read_http_response_with_header_timeout`
+    /// so Apps Script cold starts in the 8-12 s range no longer trip a
+    /// hardcoded 10 s cliff. A regression that re-introduces the old 10 s
+    /// inner timeout — or that ignores the parameter entirely — would let
+    /// cold-start batches fail in the field while passing every existing
+    /// test. This locks the parameter down: headers arriving at virtual
+    /// T=15 s must succeed when the caller asked for a 30 s budget.
+    #[tokio::test(start_paused = true)]
+    async fn read_http_response_respects_configured_header_timeout() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client_side, mut server_side) = tokio::io::duplex(8192);
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+        tokio::spawn(async move {
+            // Slow Apps Script edge: response doesn't start streaming
+            // for 15 s. Under a 10 s budget this would be Timeout; under
+            // the 30 s budget the caller passed it must succeed.
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            server_side.write_all(response).await.unwrap();
+        });
+
+        let (status, _, body) = read_http_response_with_header_timeout(
+            &mut client_side,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("15 s response must succeed under 30 s header-read budget");
+        assert_eq!(status, 200);
+        assert!(body.is_empty());
+    }
+
+    /// The header-read deadline must be *total*, not reset on every read.
+    /// Without this, a peer that drip-feeds one byte just under the
+    /// per-read timeout keeps the loop alive forever and defeats the
+    /// outer `batch_timeout` wiring — defeating the whole point of
+    /// #1088's fix. This is the regression that would survive a naive
+    /// revert to `timeout(d, stream.read(...))` inside the loop, because
+    /// every individual read completes well under `d`. With the
+    /// `timeout_at(deadline, ...)` form, total elapsed exceeds the
+    /// deadline and we get `FronterError::Timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn read_http_response_header_deadline_is_total_not_per_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client_side, mut server_side) = tokio::io::duplex(8192);
+        // Header block is 38 bytes; drip-feeding at 3 s/byte takes 114 s
+        // total. Each individual read returns within 3 s — well under
+        // the 10 s budget — so per-read semantics would NOT detect the
+        // stall.
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec();
+
+        tokio::spawn(async move {
+            for byte in response {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                server_side.write_all(&[byte]).await.unwrap();
+                server_side.flush().await.unwrap();
+            }
+        });
+
+        let result = read_http_response_with_header_timeout(
+            &mut client_side,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(FronterError::Timeout)),
+            "drip-feed slower than the total deadline must time out — \
+             got {:?}",
+            result.map(|(s, _, _)| s)
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_exit_node_response_unwraps_exit_node_envelope() {
+        // The exit-node path through Apps Script returns exit node's JSON
+        // envelope as the response body. parse_exit_node_response must
+        // unwrap it back into a raw HTTP/1.1 response so the MITM TLS
+        // write-back path sees the same shape it gets from the regular
+        // Apps Script relay.
+        let envelope = br#"{"s":200,"h":{"content-type":"application/json","x-cf-cache":"DYNAMIC"},"b":"eyJtZXNzYWdlIjoiaGVsbG8ifQ=="}"#;
+        let raw = parse_exit_node_response(envelope).expect("envelope unwrap should succeed");
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(raw_str.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(raw_str.contains("content-type: application/json\r\n"));
+        assert!(raw_str.contains("x-cf-cache: DYNAMIC\r\n"));
+        assert!(raw_str.contains("Content-Length: 19\r\n"));
+        // Body is `{"message":"hello"}` (19 bytes; the base64-decoded
+        // contents of the b field).
+        assert!(raw.ends_with(b"{\"message\":\"hello\"}"));
+    }
+
+    #[tokio::test]
+    async fn parse_exit_node_response_surfaces_explicit_error() {
+        // When the exit node returns `{e: "..."}` instead of the {s,h,b} shape,
+        // surface that error message specifically rather than letting
+        // it through as an unparseable 502 — the message string is what
+        // tells the user what went wrong (placeholder PSK, bad URL,
+        // unauthorized, etc.).
+        let envelope = br#"{"e":"unauthorized"}"#;
+        let err = parse_exit_node_response(envelope).expect_err("must surface error");
+        let msg = format!("{}", err);
+        assert!(msg.contains("unauthorized"), "got: {}", msg);
+        assert!(msg.contains("exit node"), "got: {}", msg);
+    }
+
+    #[test]
+    fn unix_to_ymd_utc_handles_known_epochs() {
+        // Anchors chosen to catch the common off-by-one errors (pre/post
+        // leap day, pre/post epoch, year-end rollover).
+        assert_eq!(unix_to_ymd_utc(0), (1970, 1, 1));                    // epoch
+        assert_eq!(unix_to_ymd_utc(86_399), (1970, 1, 1));               // one sec before day 2
+        assert_eq!(unix_to_ymd_utc(86_400), (1970, 1, 2));               // day 2 starts at midnight
+        assert_eq!(unix_to_ymd_utc(951_782_400), (2000, 2, 29));         // leap day (Feb 29, 2000)
+        assert_eq!(unix_to_ymd_utc(951_868_800), (2000, 3, 1));          // day after leap Feb
+        assert_eq!(unix_to_ymd_utc(1_583_020_800), (2020, 3, 1));        // day after a leap Feb
+        assert_eq!(unix_to_ymd_utc(1_735_689_599), (2024, 12, 31));      // last sec of 2024
+        assert_eq!(unix_to_ymd_utc(1_735_689_600), (2025, 1, 1));        // first sec of 2025
+    }
+
+    #[test]
+    fn seconds_until_pacific_midnight_is_bounded() {
+        let n = seconds_until_pacific_midnight();
+        // Must be in (0, 86400] for any valid system clock.
+        assert!(n > 0 && n <= 86_400);
+    }
+
+    #[test]
+    fn nth_sunday_of_month_anchors() {
+        // Spot-check Sakamoto's day-of-week + offset arithmetic against
+        // a few known Sundays. Mistakes here would silently shift the
+        // DST transition by ±1 week.
+        // March 2026: 2nd Sunday is March 8 (Sun Mar 1, Sun Mar 8).
+        assert_eq!(nth_sunday_of_month(2026, 3, 2), 8);
+        // November 2026: 1st Sunday is November 1 (Sun Nov 1).
+        assert_eq!(nth_sunday_of_month(2026, 11, 1), 1);
+        // March 2024: 2nd Sunday is March 10 (Sun Mar 3, Sun Mar 10).
+        assert_eq!(nth_sunday_of_month(2024, 3, 2), 10);
+        // November 2024: 1st Sunday is November 3.
+        assert_eq!(nth_sunday_of_month(2024, 11, 1), 3);
+        // March 2027: 2nd Sunday is March 14.
+        assert_eq!(nth_sunday_of_month(2027, 3, 2), 14);
+    }
+
+    #[test]
+    fn pacific_dst_window_anchors() {
+        // Outside the DST window: PST.
+        assert!(!pacific_is_dst(2026, 1, 15));
+        assert!(!pacific_is_dst(2026, 12, 25));
+        assert!(!pacific_is_dst(2026, 2, 28));
+        assert!(!pacific_is_dst(2026, 11, 5)); // first Sun of Nov 2026 = Nov 1; Nov 5 is past
+        // Inside: PDT.
+        assert!(pacific_is_dst(2026, 6, 1));
+        assert!(pacific_is_dst(2026, 9, 30));
+        // Boundary: March 8, 2026 (DST start day) and after = PDT.
+        assert!(!pacific_is_dst(2026, 3, 7));
+        assert!(pacific_is_dst(2026, 3, 8));
+        // Boundary: Oct 31 = PDT, Nov 1 = first Sunday = PST flips on.
+        assert!(pacific_is_dst(2026, 10, 31));
+        assert!(!pacific_is_dst(2026, 11, 1));
+    }
+
+    #[test]
+    fn filter_forwarded_headers_strips_identity_revealing_headers() {
+        // Issue #104: any proxy/extension that inserts these must not
+        // leak the client's real IP to origin via the Apps Script relay.
+        let input: Vec<(String, String)> = vec![
+            ("X-Forwarded-For".into(), "203.0.113.42".into()),
+            ("X-Real-IP".into(), "203.0.113.42".into()),
+            ("Forwarded".into(), "for=203.0.113.42".into()),
+            ("Via".into(), "1.1 squid".into()),
+            ("CF-Connecting-IP".into(), "203.0.113.42".into()),
+            ("True-Client-IP".into(), "203.0.113.42".into()),
+            ("X-Client-IP".into(), "203.0.113.42".into()),
+            ("Fastly-Client-IP".into(), "203.0.113.42".into()),
+            ("X-Cluster-Client-IP".into(), "203.0.113.42".into()),
+            ("Client-IP".into(), "203.0.113.42".into()),
+            ("X-Originating-IP".into(), "203.0.113.42".into()),
+            ("X-Forwarded-Host".into(), "internal.example".into()),
+            ("X-Forwarded-Proto".into(), "https".into()),
+            ("X-Forwarded-Port".into(), "8080".into()),
+            ("X-Forwarded-Server".into(), "lb-01.example".into()),
+            ("X-Forwarded-Ssl".into(), "on".into()),
+            // Mix in a legitimate header that MUST pass through.
+            ("User-Agent".into(), "Mozilla/5.0".into()),
+            ("Accept".into(), "text/html".into()),
+        ];
+        let out = filter_forwarded_headers(&input);
+        let keys: Vec<String> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+        // All identity-revealing headers must be dropped.
+        for h in [
+            "x-forwarded-for",
+            "x-real-ip",
+            "forwarded",
+            "via",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-client-ip",
+            "fastly-client-ip",
+            "x-cluster-client-ip",
+            "client-ip",
+            "x-originating-ip",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-server",
+            "x-forwarded-ssl",
+        ] {
+            assert!(!keys.iter().any(|k| k == h), "{} must be stripped", h);
+        }
+        // And legitimate headers must survive.
+        assert!(keys.iter().any(|k| k == "user-agent"));
+        assert!(keys.iter().any(|k| k == "accept"));
+    }
+
+    #[test]
+    fn normalize_x_graphql_trims_after_variables() {
+        // Real-looking x.com GraphQL URL with variables + features +
+        // fieldToggles. Only the variables= prefix should survive.
+        let in_url = "https://x.com/i/api/graphql/abcd1234/TweetDetail?variables=%7B%22focalTweetId%22%3A%221234%22%7D&features=%7B%22responsive_web_graphql_timeline_navigation_enabled%22%3Atrue%7D&fieldToggles=%7B%22withArticleRichContentState%22%3Atrue%7D";
+        let out = normalize_x_graphql_url(in_url);
+        assert!(out.starts_with("https://x.com/i/api/graphql/abcd1234/TweetDetail?variables="));
+        assert!(!out.contains("features="));
+        assert!(!out.contains("fieldToggles="));
+        assert!(!out.contains('&'));
+    }
+
+    #[test]
+    fn normalize_x_graphql_leaves_non_x_hosts_alone() {
+        let cases = [
+            "https://twitter.com/i/api/graphql/x/y?variables=z&features=q",
+            "https://x.co/i/api/graphql/x/y?variables=z&features=q",
+            "https://api.x.com/i/api/graphql/x/y?variables=z&features=q",
+            "https://example.com/?variables=1&other=2",
+        ];
+        for u in cases {
+            assert_eq!(normalize_x_graphql_url(u), u, "should pass through: {}", u);
+        }
+    }
+
+    #[test]
+    fn normalize_x_graphql_leaves_non_graphql_paths_alone() {
+        let cases = [
+            "https://x.com/home",
+            "https://x.com/i/api/2/notifications/view/generic.json",
+            "https://x.com/i/api/graphql/x/y",       // no query
+            "https://x.com/i/api/graphql/x/y?features=1&variables=2", // variables not first
+        ];
+        for u in cases {
+            assert_eq!(normalize_x_graphql_url(u), u, "should pass through: {}", u);
+        }
+    }
+
+    #[test]
+    fn normalize_x_graphql_is_idempotent() {
+        let once = normalize_x_graphql_url(
+            "https://x.com/i/api/graphql/H/Op?variables=%7B%7D&features=%7B%7D",
+        );
+        let twice = normalize_x_graphql_url(&once);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn extract_host_strips_scheme_port_path() {
+        assert_eq!(extract_host("https://example.com/foo"), Some("example.com".into()));
+        assert_eq!(extract_host("http://foo.bar:8080/x"), Some("foo.bar".into()));
+        assert_eq!(extract_host("https://user:pw@host.test/x"), Some("host.test".into()));
+        assert_eq!(extract_host("https://[2001:db8::1]:443/"), Some("2001:db8::1".into()));
+        assert_eq!(extract_host("API.X.com/foo"), Some("api.x.com".into()));
+        assert_eq!(extract_host(""), None);
+    }
+
+    #[test]
+    fn build_sni_pool_extends_for_google() {
+        let p = build_sni_pool("www.google.com");
+        assert!(p.len() >= 2);
+        assert_eq!(p[0], "www.google.com");
+        assert!(p.iter().any(|s| s == "mail.google.com"));
+    }
+
+    #[test]
+    fn build_sni_pool_preserves_custom_primary() {
+        let p = build_sni_pool("mycustom.edge.example.com");
+        assert_eq!(p, vec!["mycustom.edge.example.com".to_string()]);
+    }
+
+    #[test]
+    fn filter_drops_connection_specific() {
+        let h = vec![
+            ("Host".into(), "example.com".into()),
+            ("Connection".into(), "keep-alive".into()),
+            ("Content-Length".into(), "5".into()),
+            ("Cookie".into(), "a=b".into()),
+            ("Proxy-Connection".into(), "close".into()),
+        ];
+        let out = filter_forwarded_headers(&h);
+        let names: Vec<_> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+        assert!(names.contains(&"cookie".to_string()));
+        assert!(!names.contains(&"host".to_string()));
+        assert!(!names.contains(&"connection".to_string()));
+        assert!(!names.contains(&"content-length".to_string()));
+        assert!(!names.contains(&"proxy-connection".to_string()));
+    }
+
+    #[test]
+    fn strip_brotli_keeps_gzip() {
+        let r = strip_brotli_from_accept_encoding("gzip, deflate, br");
+        assert_eq!(r, "gzip, deflate");
+        let r = strip_brotli_from_accept_encoding("br");
+        assert_eq!(r, "");
+        let r = strip_brotli_from_accept_encoding("gzip;q=1.0, br;q=0.5");
+        assert_eq!(r, "gzip;q=1.0");
+    }
+
+    #[test]
+    fn redirect_absolute_url() {
+        let (p, h) = parse_redirect("https://script.googleusercontent.com/abc?x=1");
+        assert_eq!(p, "/abc?x=1");
+        assert_eq!(h.as_deref(), Some("script.googleusercontent.com"));
+    }
+
+    #[test]
+    fn redirect_relative() {
+        let (p, h) = parse_redirect("/somewhere");
+        assert_eq!(p, "/somewhere");
+        assert!(h.is_none());
+    }
+
+    #[test]
+    fn parse_relay_basic_json() {
+        let body = r#"{"s":200,"h":{"Content-Type":"text/plain"},"b":"SGVsbG8="}"#;
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.contains("Content-Type: text/plain\r\n"));
+        assert!(s.contains("Content-Length: 5\r\n"));
+        assert!(s.ends_with("Hello"));
+    }
+
+    #[test]
+    fn parse_content_range_total_accepts_mixed_case_unit() {
+        let headers = vec![("Content-Range".to_string(), "Bytes 0-4/20".to_string())];
+        assert_eq!(parse_content_range_total(&headers), Some(20));
+    }
+
+    #[test]
+    fn parse_content_range_total_rejects_descending_range() {
+        let headers = vec![("Content-Range".to_string(), "bytes 10-4/20".to_string())];
+        assert_eq!(parse_content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn parse_content_range_total_rejects_end_past_total() {
+        let headers = vec![("Content-Range".to_string(), "bytes 0-20/20".to_string())];
+        assert_eq!(parse_content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn validate_probe_range_accepts_decoded_full_entity_body_mismatch() {
+        let mut raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Range: bytes 0-11247/11248\r\n\
+Content-Type: text/javascript\r\n\
+Vary: Accept-Encoding\r\n\
+Content-Length: 45812\r\n\r\n"
+            .to_vec();
+        raw.extend(std::iter::repeat(b'x').take(45_812));
+
+        let (status, headers, body) = split_response(&raw).unwrap();
+        assert_eq!(
+            validate_probe_range(status, &headers, body, RANGE_PARALLEL_CHUNK_BYTES - 1),
+            Some(ContentRange {
+                start: 0,
+                end: 11_247,
+                total: 11_248,
+            }),
+        );
+
+        let rewritten = rewrite_206_to_200(&raw);
+        let (status, headers, body) = split_response(&rewritten).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 45_812);
+        assert!(!headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-range")));
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .map(|(_, v)| v.as_str()),
+            Some("45812"),
+        );
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_missing_content_range() {
+        assert!(validate_probe_range(206, &[], b"hello", 4).is_none());
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_nonzero_start() {
+        let headers = vec![("Content-Range".to_string(), "bytes 1-4/20".to_string())];
+        assert!(validate_probe_range(206, &headers, b"hell", 4).is_none());
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_end_past_requested_end() {
+        let headers = vec![("Content-Range".to_string(), "bytes 0-5/20".to_string())];
+        assert!(validate_probe_range(206, &headers, b"hello!", 4).is_none());
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_body_length_mismatch() {
+        let headers = vec![("Content-Range".to_string(), "bytes 0-4/20".to_string())];
+        assert!(validate_probe_range(206, &headers, b"hey", 4).is_none());
+    }
+
+    #[test]
+    fn extract_exact_range_body_rejects_body_length_mismatch() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Range: bytes 5-9/20\r\n\
+Content-Length: 3\r\n\r\n\
+hey";
+        let err = extract_exact_range_body(raw, 5, 9, 20).unwrap_err();
+        assert_eq!(err, "Content-Range/body length mismatch");
+    }
+
+    #[test]
+    fn extract_exact_range_body_rejects_mismatched_content_range() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Range: bytes 5-9/20\r\n\
+Content-Length: 5\r\n\r\n\
+hello";
+        let err = extract_exact_range_body(raw, 10, 14, 20).unwrap_err();
+        assert_eq!(err, "unexpected Content-Range");
+    }
+
+    #[test]
+    fn assemble_200_head_uses_declared_length_and_strips_range_meta() {
+        // Streaming path passes `total` (full file size) as the declared
+        // length even though the body hasn't been assembled yet. The head
+        // block must carry that as Content-Length and must NOT carry the
+        // probe's Content-Range (would mark response as partial and
+        // clients would reject mid-stream chunks past the probe's end).
+        let probe_headers = vec![
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            ("Content-Range".to_string(), "bytes 0-262143/109605203".to_string()),
+            ("Content-Length".to_string(), "262144".to_string()),
+            ("Content-Encoding".to_string(), "gzip".to_string()),
+            ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ("Connection".to_string(), "close".to_string()),
+            ("Cache-Control".to_string(), "max-age=300".to_string()),
+        ];
+        let head = assemble_200_head(&probe_headers, 109_605_203);
+        let s = std::str::from_utf8(&head).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+        assert!(s.contains("Content-Length: 109605203\r\n"));
+        // Hop-by-hop and content-meta the buffered path strips must
+        // ALSO be stripped by the streaming head (else range responses
+        // would mislead clients).
+        assert!(!s.contains("Content-Range:"));
+        assert!(!s.contains("Content-Encoding:"));
+        assert!(!s.contains("Transfer-Encoding:"));
+        assert!(!s.contains("Connection:"));
+        // Original Content-Length from the probe must NOT survive —
+        // we computed our own from `total`.
+        assert!(!s.contains("Content-Length: 262144\r\n"));
+        // Non-stripped headers pass through.
+        assert!(s.contains("Content-Type: application/octet-stream\r\n"));
+        assert!(s.contains("Cache-Control: max-age=300\r\n"));
+    }
+
+    #[test]
+    fn assemble_200_head_matches_full_200_head_for_buffered_path() {
+        // The two assemblers must agree on header semantics so a
+        // response taken via the buffered path is byte-identical (in
+        // its head block) to the same response taken via the streaming
+        // path. Lock that in here so future header-skip changes don't
+        // drift between the two.
+        let headers = vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("Content-Range".to_string(), "bytes 0-9/10".to_string()),
+            ("X-Custom".to_string(), "foo".to_string()),
+        ];
+        let body = b"helloworld";
+        let full = assemble_full_200(&headers, body);
+        let head_only = assemble_200_head(&headers, body.len() as u64);
+        let sep = b"\r\n\r\n";
+        let idx = full.windows(sep.len()).position(|w| w == sep).unwrap();
+        assert_eq!(&full[..idx + sep.len()], head_only.as_slice());
+    }
+
+    #[tokio::test]
+    async fn write_response_with_head_transform_applies_to_head_not_body() {
+        // The bridge between writer-based API and the buffered/error
+        // paths: head gets the transform; body bytes are forwarded
+        // unchanged so binary payloads aren't corrupted by an
+        // accidental UTF-8 round-trip in the transform path.
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: app/octet-stream\r\nContent-Length: 4\r\n\r\n\x00\x01\x02\xff";
+        let mut buf: Vec<u8> = Vec::new();
+        let transform = |head: &[u8]| -> Vec<u8> {
+            // Tag the head so we can prove the transform ran on it.
+            // Strip the trailing CRLFCRLF terminator, append a new
+            // header line, then restore the terminator.
+            let sep = b"\r\n\r\n";
+            let mut out = head.strip_suffix(sep).unwrap_or(head).to_vec();
+            out.extend_from_slice(b"\r\nX-Tag: yes\r\n\r\n");
+            out
+        };
+        write_response_with_head_transform(&mut buf, response, &transform)
+            .await
+            .unwrap();
+        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let (head, body) = (&buf[..sep_pos + 4], &buf[sep_pos + 4..]);
+        let head_s = std::str::from_utf8(head).unwrap();
+        assert!(head_s.contains("X-Tag: yes\r\n"));
+        // Body is byte-identical — no UTF-8 lossy conversion.
+        assert_eq!(body, b"\x00\x01\x02\xff");
+    }
+
+    #[tokio::test]
+    async fn write_response_with_head_transform_passes_through_when_no_terminator() {
+        // Defensive: a payload missing `\r\n\r\n` (corrupted upstream,
+        // raw error blob) must be forwarded byte-identical so we don't
+        // synthesise a fake header for non-HTTP/1.x bytes.
+        let response = b"not an http response";
+        let mut buf: Vec<u8> = Vec::new();
+        let transform = |_: &[u8]| -> Vec<u8> { b"XX".to_vec() };
+        write_response_with_head_transform(&mut buf, response, &transform)
+            .await
+            .unwrap();
+        assert_eq!(buf.as_slice(), response);
+    }
+
+    #[test]
+    fn plan_remaining_ranges_basic_chunking() {
+        // probe covered 0..=3 of a 20-byte file at 5-byte chunks →
+        // remaining ranges are 4-8, 9-13, 14-18, 19-19.
+        let ranges: Vec<_> = plan_remaining_ranges(3, 20, 5).collect();
+        assert_eq!(ranges, vec![(4, 8), (9, 13), (14, 18), (19, 19)]);
+    }
+
+    #[test]
+    fn plan_remaining_ranges_yields_nothing_when_probe_covers_everything() {
+        // Defensive: even though the caller is supposed to short-circuit
+        // when the probe covers the entity, the iterator itself must be
+        // a no-op rather than emit a bogus 0-length range.
+        let ranges: Vec<_> = plan_remaining_ranges(19, 20, 5).collect();
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn plan_remaining_ranges_handles_huge_total_lazily_without_oom() {
+        // Regression for the DoS introduced when the buffered+streaming
+        // refactor (1.9.23) initially built the full ranges Vec before
+        // branching on size. A hostile origin advertising
+        // `Content-Range: bytes 0-262143/<huge>` can pass the probe
+        // checks (matching 256 KiB body, valid total) and used to drive
+        // ~6 GB of `Vec<(u64, u64)>` allocation for a 100 TiB total.
+        //
+        // Lazy iteration must let us pull a bounded number of items
+        // from a u64::MAX-sized total without panicking or allocating
+        // the whole plan. Pulling 10 items proves we never materialised
+        // ~2^44 of them up front.
+        let total = u64::MAX;
+        let chunk = 256 * 1024;
+        let probe_end = chunk - 1;
+        let first_ten: Vec<_> = plan_remaining_ranges(probe_end, total, chunk).take(10).collect();
+        assert_eq!(first_ten.len(), 10);
+        // First range starts right after the probe.
+        assert_eq!(first_ten[0].0, probe_end + 1);
+        // Each range covers exactly one chunk except possibly the last
+        // — which here can't be the tail because we only took 10.
+        for (s, e) in &first_ten {
+            assert_eq!(e - s + 1, chunk);
+        }
+        // Successive ranges are contiguous.
+        for w in first_ten.windows(2) {
+            assert_eq!(w[1].0, w[0].1 + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chunks_to_writer_writes_head_probe_then_chunks_in_order() {
+        // Happy path: streaming writer must emit
+        //   head + probe_body + chunk1_body + chunk2_body + …
+        // in input order so a download client reading byte 0 onward
+        // sees a coherent response.
+        use futures_util::stream::{self, StreamExt as _};
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+        let probe = b"AB";
+        // The streaming function consumes whatever `Stream` it's given;
+        // tests feed it `stream::iter` of synthetic chunk results so
+        // we exercise the writer + ordering logic without needing a
+        // live DomainFronter / Apps Script.
+        let fetches = stream::iter(vec![
+            (2u64, 5u64, Ok::<Vec<u8>, &'static str>(b"CDEF".to_vec())),
+            (6u64, 9u64, Ok::<Vec<u8>, &'static str>(b"GHIJ".to_vec())),
+        ]);
+        let mut buf = Vec::new();
+        stream_chunks_to_writer(
+            &mut VecAsyncWriter(&mut buf),
+            head,
+            probe,
+            10,
+            fetches.map(|x| x),
+            "https://example.test/file",
+        )
+        .await
+        .unwrap();
+        // Whole wire output: head, then probe body, then chunks in
+        // input order — no chunk reordered to "fastest first."
+        let expected: Vec<u8> = [head.as_slice(), probe.as_slice(), b"CDEF", b"GHIJ"].concat();
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn dispatch_range_response_wrapper_buffers_through_64mib_ceiling() {
+        // Pre-1.9.23 behavior preservation: `relay_parallel_range ->
+        // Vec<u8>` used to stitch range-capable responses up to the
+        // old `MAX_STITCHED_RANGE_BYTES` cap of 64 MiB. The first
+        // round of this PR collapsed that cap into the new 40 MiB
+        // streaming threshold, regressing 40-64 MiB downloads
+        // through the wrapper (Apps Script's single-GET path returns
+        // 502/504 above ~40 MiB). Restored via separate constants:
+        // wrapper stays buffered up to BUFFERED_STITCH_MAX_BYTES,
+        // not APPS_SCRIPT_BODY_MAX_BYTES.
+        assert_eq!(
+            dispatch_range_response(40 * 1024 * 1024, false),
+            RangeDispatch::Buffered,
+        );
+        assert_eq!(
+            dispatch_range_response(50 * 1024 * 1024, false),
+            RangeDispatch::Buffered,
+        );
+        assert_eq!(
+            dispatch_range_response(BUFFERED_STITCH_MAX_BYTES, false),
+            RangeDispatch::Buffered,
+        );
+    }
+
+    #[test]
+    fn dispatch_range_response_wrapper_falls_back_above_buffered_cap() {
+        // Lock-in for the Vec<u8> wrapper contract (Issue #162):
+        // above the buffered ceiling the wrapper MUST NOT take the
+        // streaming branch (which would emit a partial 200 OK that
+        // a `Vec<u8>` consumer can't react to). Above the buffered
+        // cap, fall back to single GET — same path the pre-1.9.23
+        // wrapper took above its 64 MiB cliff.
+        assert_eq!(
+            dispatch_range_response(BUFFERED_STITCH_MAX_BYTES + 1, false),
+            RangeDispatch::FallbackSingleGet,
+        );
+        assert_eq!(
+            dispatch_range_response(100 * 1024 * 1024, false),
+            RangeDispatch::FallbackSingleGet,
+        );
+        assert_eq!(
+            dispatch_range_response(u64::MAX, false),
+            RangeDispatch::FallbackSingleGet,
+        );
+    }
+
+    #[test]
+    fn dispatch_range_response_writer_api_streams_above_apps_script_ceiling() {
+        // Writer-based API contract: streams above the Apps Script
+        // single-GET ceiling so large downloads (>40 MiB) actually
+        // deliver. Without this, we'd be back to the pre-fix 504
+        // timeout for the 104 MiB DMG that motivated #1042. The
+        // writer API streams in the 40-64 MiB band too (where the
+        // wrapper would still buffer): that's intentional — on
+        // chunk failure, streaming truncates and the download client
+        // resumes via Range, while the buffered path's fallback
+        // can't recover at this size anyway.
+        //
+        // Upper bound is the streaming cap MAX_STREAMED_RANGE_BYTES
+        // (quota-DoS guard); above it, see
+        // `dispatch_range_response_rejects_streamed_totals_above_streaming_cap`.
+        assert_eq!(
+            dispatch_range_response(APPS_SCRIPT_BODY_MAX_BYTES + 1, true),
+            RangeDispatch::Stream,
+        );
+        assert_eq!(
+            dispatch_range_response(50 * 1024 * 1024, true),
+            RangeDispatch::Stream,
+        );
+        assert_eq!(
+            dispatch_range_response(BUFFERED_STITCH_MAX_BYTES + 1, true),
+            RangeDispatch::Stream,
+        );
+        // Just under the streaming cap still streams.
+        assert_eq!(
+            dispatch_range_response(MAX_STREAMED_RANGE_BYTES, true),
+            RangeDispatch::Stream,
+        );
+    }
+
+    #[test]
+    fn dispatch_range_response_rejects_streamed_totals_above_streaming_cap() {
+        // Quota-DoS guard for the writer API: a hostile origin can
+        // advertise an absurd Content-Range total (e.g. u64::MAX) and
+        // pass the probe checks with a normal-sized first-chunk body,
+        // making us issue chunk Apps Script calls until the client
+        // disconnects. Each call counts toward the daily quota
+        // (~20 k requests/day free tier), so an unattended hostile
+        // download would lock the user out of the relay. Refuse
+        // anything above MAX_STREAMED_RANGE_BYTES instead of
+        // streaming.
+        assert_eq!(
+            dispatch_range_response(MAX_STREAMED_RANGE_BYTES + 1, true),
+            RangeDispatch::RejectTooLarge,
+        );
+        assert_eq!(
+            dispatch_range_response(u64::MAX, true),
+            RangeDispatch::RejectTooLarge,
+        );
+        // At the cap, streaming is still allowed. The boundary is
+        // strict greater-than so the constant itself is reachable.
+        assert_eq!(
+            dispatch_range_response(MAX_STREAMED_RANGE_BYTES, true),
+            RangeDispatch::Stream,
+        );
+        // Wrapper (streaming_allowed=false) hits its own
+        // BUFFERED_STITCH_MAX_BYTES cliff far below MAX_STREAMED_…,
+        // so any oversized total routes to FallbackSingleGet (Apps
+        // Script's single-GET will reject it naturally), not to
+        // RejectTooLarge.
+        assert_eq!(
+            dispatch_range_response(MAX_STREAMED_RANGE_BYTES + 1, false),
+            RangeDispatch::FallbackSingleGet,
+        );
+        assert_eq!(
+            dispatch_range_response(u64::MAX, false),
+            RangeDispatch::FallbackSingleGet,
+        );
+    }
+
+    #[test]
+    fn dispatch_range_response_at_or_below_apps_script_ceiling_stays_buffered() {
+        // At or below the Apps Script ceiling, both API surfaces stay
+        // buffered — the buffered path has a real recovery story (a
+        // chunk failure falls back to single GET, which delivers a
+        // complete file when ≤ 40 MiB).
+        for streaming_allowed in [true, false] {
+            assert_eq!(
+                dispatch_range_response(APPS_SCRIPT_BODY_MAX_BYTES, streaming_allowed),
+                RangeDispatch::Buffered,
+            );
+            assert_eq!(
+                dispatch_range_response(1024 * 1024, streaming_allowed),
+                RangeDispatch::Buffered,
+            );
+            assert_eq!(
+                dispatch_range_response(1, streaming_allowed),
+                RangeDispatch::Buffered,
+            );
+            assert_eq!(
+                dispatch_range_response(0, streaming_allowed),
+                RangeDispatch::Buffered,
+            );
+        }
+    }
+
+    /// Test-only `AsyncWrite` that records the byte-offset of every
+    /// `poll_flush` call. Used to verify
+    /// `stream_chunks_to_writer` flushes the committed prefix before
+    /// surfacing a chunk-validation error — critical for TLS streams
+    /// where the partial body sits in the TLS writer's in-memory
+    /// buffer and would otherwise be dropped on connection close.
+    struct FlushTrackingWriter {
+        buf: Vec<u8>,
+        /// Byte offset (relative to `buf.len()` at the time) of each
+        /// `poll_flush` call. Lets a test assert "flush happened
+        /// after byte N had been written."
+        flushed_at: Vec<usize>,
+    }
+
+    impl FlushTrackingWriter {
+        fn new() -> Self {
+            Self { buf: Vec::new(), flushed_at: Vec::new() }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FlushTrackingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.get_mut().buf.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let me = self.get_mut();
+            let at = me.buf.len();
+            me.flushed_at.push(at);
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chunks_to_writer_flushes_before_returning_chunk_error() {
+        // TLS-safety lock-in: chunk-validation failure surfaces as
+        // `Err`, and the caller (proxy_server.rs) typically uses `?`
+        // to propagate — which means the post-error `stream.flush()`
+        // in the caller never runs. Without the in-function flush,
+        // bytes buffered inside the TLS writer get dropped when the
+        // connection closes, and the download client sees a clean
+        // empty body instead of the partial prefix it needs to
+        // resume via Range. This test asserts flush() is called
+        // after the committed prefix bytes have been written and
+        // before the function returns.
+        use futures_util::stream::{self, StreamExt as _};
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n";
+        let probe = b"AB";
+        let fetches = stream::iter(vec![
+            (2u64, 5u64, Ok::<Vec<u8>, &'static str>(b"CDEF".to_vec())),
+            (6u64, 9u64, Err::<Vec<u8>, &'static str>("validation failure")),
+        ]);
+        let mut writer = FlushTrackingWriter::new();
+        let result = stream_chunks_to_writer(
+            &mut writer,
+            head,
+            probe,
+            12,
+            fetches.map(|x| x),
+            "https://example.test/file",
+        )
+        .await;
+        assert!(result.is_err());
+
+        // Bytes written before the failure: head + probe + first
+        // chunk = head_len + 2 + 4.
+        let expected_committed = head.len() + 2 + 4;
+        assert_eq!(writer.buf.len(), expected_committed);
+
+        // Flush must have been called after the committed prefix
+        // was in place — i.e., at the same byte count as `buf.len()`.
+        assert!(
+            writer.flushed_at.iter().any(|&at| at == expected_committed),
+            "flush() must run after committed prefix is written; flushed_at={:?}, expected at byte {}",
+            writer.flushed_at,
+            expected_committed,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_chunks_to_writer_emits_progress_log_at_each_16mib_boundary() {
+        // User feedback on PR #1085: large streamed downloads went
+        // silent in the logs between "starting N chunks" and
+        // completion, with no progress signal. This test locks in
+        // the periodic progress lines by capturing the tracing
+        // output of a synthetic 40 MiB stream and counting how many
+        // `range-parallel-stream:` lines mention "MiB" (the progress
+        // lines do; the start-up summary phrases it differently).
+        //
+        // At 40 MiB total and 16 MiB intervals we expect two
+        // crossings — at 16 MiB and 32 MiB. Strictly *not* one at
+        // 0 MiB (the threshold must be reached, not just initialised)
+        // and *not* one at 40 MiB (40 < next_progress_log_at=48 once
+        // we've crossed 32 MiB).
+        use futures_util::stream;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct LogCapture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogCapture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for LogCapture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_target(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // 40 MiB total. Probe is one 256 KiB chunk; the rest of the
+        // file is 159 same-sized chunks fed as a synthetic stream.
+        let chunk_size: u64 = 256 * 1024;
+        let total: u64 = 40 * 1024 * 1024;
+        let probe_body = vec![0u8; chunk_size as usize];
+        let mut chunks_data: Vec<(u64, u64, Result<Vec<u8>, &'static str>)> = Vec::new();
+        let mut start = chunk_size;
+        while start < total {
+            let end = (start + chunk_size - 1).min(total - 1);
+            let len = (end - start + 1) as usize;
+            chunks_data.push((start, end, Ok(vec![0u8; len])));
+            start = end + 1;
+        }
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", total).into_bytes();
+
+        let mut buf: Vec<u8> = Vec::new();
+        stream_chunks_to_writer(
+            &mut VecAsyncWriter(&mut buf),
+            &head,
+            &probe_body,
+            total,
+            stream::iter(chunks_data),
+            "https://example.test/big",
+        )
+        .await
+        .unwrap();
+        // Wire output sanity: head + 40 MiB body, exactly.
+        assert_eq!(buf.len() as u64, head.len() as u64 + total);
+
+        // Inspect the captured log. The two progress lines should
+        // mention `16/40` and `32/40` (MiB emitted / MiB total).
+        // Drop the subscriber guard so any inadvertent log lines
+        // from drop-handlers don't race with our read.
+        drop(_guard);
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let progress_lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("range-parallel-stream:") && l.contains(" MiB ("))
+            .collect();
+        assert_eq!(
+            progress_lines.len(),
+            2,
+            "expected 2 progress lines at the 16 / 32 MiB crossings; full log:\n{}",
+            log,
+        );
+        assert!(
+            progress_lines[0].contains("16/40 MiB (40%)"),
+            "first progress line should read 16/40 MiB (40%); got: {}",
+            progress_lines[0],
+        );
+        assert!(
+            progress_lines[1].contains("32/40 MiB (80%)"),
+            "second progress line should read 32/40 MiB (80%); got: {}",
+            progress_lines[1],
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chunks_to_writer_flushes_after_head_and_probe_for_first_byte_latency() {
+        // "First bytes quickly" lock-in: after writing head + probe
+        // body, the function must flush before going into the
+        // chunk-fetch loop. Without this, the response start
+        // (status code, headers, first 256 KiB of body) may sit in
+        // intermediate buffers (TLS writer, kernel send buffer with
+        // small initial cwnd, intermediate proxy buffers) while we
+        // round-trip ~2s/chunk to Apps Script for the remaining
+        // chunks — giving the user a "stuck at 0%" progress bar
+        // for hundreds of ms to seconds on a multi-MiB download.
+        use futures_util::stream::{self, StreamExt as _};
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n";
+        let probe = b"AB";
+        let fetches = stream::iter(vec![
+            (2u64, 5u64, Ok::<Vec<u8>, &'static str>(b"CDEF".to_vec())),
+            (6u64, 9u64, Ok::<Vec<u8>, &'static str>(b"GHIJ".to_vec())),
+            (10u64, 13u64, Ok::<Vec<u8>, &'static str>(b"KLMN".to_vec())),
+        ]);
+        let mut writer = FlushTrackingWriter::new();
+        stream_chunks_to_writer(
+            &mut writer,
+            head,
+            probe,
+            14,
+            fetches.map(|x| x),
+            "https://example.test/file",
+        )
+        .await
+        .unwrap();
+
+        // At least one flush must land at byte offset = head + probe
+        // (BEFORE any chunk bytes), proving the early flush ran.
+        let head_plus_probe = head.len() + probe.len();
+        assert!(
+            writer.flushed_at.iter().any(|&at| at == head_plus_probe),
+            "early flush must run after head+probe but before chunks; flushed_at={:?}, expected at byte {}",
+            writer.flushed_at,
+            head_plus_probe,
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_branch_with_real_cors_transform_emits_acl_headers_then_body() {
+        // Cross-module integration test: the streaming branch's
+        // `transform_head` closure is wired up in proxy_server.rs
+        // from the request's Origin header to call
+        // `inject_cors_into_head`. Helper tests cover the head
+        // assembler and the CORS rewriter in isolation; this test
+        // composes them as the production proxy dispatch does, so
+        // a regression in either the closure construction or the
+        // head-only CORS variant surfaces here.
+        use crate::proxy_server::inject_cors_into_head;
+        use futures_util::stream::{self, StreamExt as _};
+
+        let cors_origin: Option<String> = Some("https://www.youtube.com".to_string());
+        // Same closure the proxy_server dispatch uses (see
+        // proxy_server.rs `handle_mitm_request`).
+        let transform = |head: &[u8]| -> Vec<u8> {
+            match cors_origin.as_deref() {
+                Some(o) => inject_cors_into_head(head, o).unwrap_or_else(|| head.to_vec()),
+                None => head.to_vec(),
+            }
+        };
+
+        let probe_headers = vec![
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            ("Content-Range".to_string(), "bytes 0-3/12".to_string()),
+            // Origin sent ACL=* with credentials — exactly the YouTube
+            // comments failure mode `inject_cors_response_headers`
+            // was added to fix. The streaming-path CORS variant must
+            // strip this and substitute the request origin.
+            ("Access-Control-Allow-Origin".to_string(), "*".to_string()),
+        ];
+        let probe_body = b"ABCD";
+        let chunks = stream::iter(vec![
+            (4u64, 7u64, Ok::<Vec<u8>, &'static str>(b"EFGH".to_vec())),
+            (8u64, 11u64, Ok::<Vec<u8>, &'static str>(b"IJKL".to_vec())),
+        ]);
+        let mut buf: Vec<u8> = Vec::new();
+        stream_range_response_to(
+            &mut VecAsyncWriter(&mut buf),
+            &probe_headers,
+            probe_body,
+            12,
+            chunks.map(|x| x),
+            &transform,
+            "https://example.test/big-file",
+        )
+        .await
+        .unwrap();
+
+        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("head terminator");
+        let head_s = std::str::from_utf8(&buf[..sep_pos + 4]).unwrap();
+        let body = &buf[sep_pos + 4..];
+
+        // Wildcard origin is gone; request origin is echoed.
+        assert!(
+            !head_s.contains("Access-Control-Allow-Origin: *"),
+            "wildcard origin must be stripped, head was: {}", head_s,
+        );
+        assert!(head_s.contains("Access-Control-Allow-Origin: https://www.youtube.com\r\n"));
+        assert!(head_s.contains("Access-Control-Allow-Credentials: true\r\n"));
+        assert!(head_s.contains("Vary: Origin\r\n"));
+        // Synthesised Content-Length = full advertised total.
+        assert!(head_s.contains("Content-Length: 12\r\n"));
+        // Body unaffected by the head transform; chunks in order.
+        assert_eq!(body, b"ABCDEFGHIJKL");
+    }
+
+    #[tokio::test]
+    async fn stream_range_response_to_assembles_head_from_probe_and_streams_chunks() {
+        // Integration test for the streaming-branch wiring in
+        // `do_relay_parallel_range_to`: given a probe response (the
+        // probe's response headers + first-chunk body), a known
+        // total, and a stream of remaining chunk results, the
+        // streaming branch must:
+        //   1. Build the response head from the probe headers via
+        //      `assemble_200_head` (keeps Content-Type etc., strips
+        //      Content-Range and writes Content-Length=total).
+        //   2. Apply the caller's `transform_head` closure to the
+        //      assembled head (e.g. CORS injection).
+        //   3. Write head → probe body → chunks (in input order)
+        //      with no reordering, no body buffering.
+        //
+        // Helper-only tests can miss the composition wiring
+        // (assemble + transform + stream_chunks); this test
+        // exercises all three together through the same free
+        // function the production dispatch uses.
+        use futures_util::stream::{self, StreamExt as _};
+        let probe_headers = vec![
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            ("Content-Range".to_string(), "bytes 0-3/12".to_string()),
+            ("Content-Length".to_string(), "4".to_string()),
+            ("X-Origin-Hint".to_string(), "abcd".to_string()),
+        ];
+        let probe_body = b"ABCD";
+        let total: u64 = 12;
+        let chunks = stream::iter(vec![
+            (4u64, 7u64, Ok::<Vec<u8>, &'static str>(b"EFGH".to_vec())),
+            (8u64, 11u64, Ok::<Vec<u8>, &'static str>(b"IJKL".to_vec())),
+        ]);
+        let transform = |head: &[u8]| -> Vec<u8> {
+            // Append a synthetic CORS-style header so we can assert
+            // the transform actually got the head bytes, not the
+            // probe body.
+            let sep = b"\r\n\r\n";
+            let mut out = head.strip_suffix(sep).unwrap_or(head).to_vec();
+            out.extend_from_slice(b"\r\nX-Transform: applied\r\n\r\n");
+            out
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        stream_range_response_to(
+            &mut VecAsyncWriter(&mut buf),
+            &probe_headers,
+            probe_body,
+            total,
+            chunks.map(|x| x),
+            &transform,
+            "https://example.test/big-file",
+        )
+        .await
+        .unwrap();
+
+        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("head terminator");
+        let head = &buf[..sep_pos + 4];
+        let body = &buf[sep_pos + 4..];
+        let head_s = std::str::from_utf8(head).unwrap();
+
+        // Composition #1: assemble_200_head ran with the probe
+        // headers and the full total.
+        assert!(head_s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head_s.contains("Content-Length: 12\r\n"));
+        // Original Content-Length from the probe (=4) must be gone.
+        assert!(!head_s.contains("Content-Length: 4\r\n"));
+        // Content-Range is stripped (it described the probe slice,
+        // not the synthesised full response).
+        assert!(!head_s.contains("Content-Range:"));
+        // Non-stripped probe headers pass through.
+        assert!(head_s.contains("Content-Type: application/octet-stream\r\n"));
+        assert!(head_s.contains("X-Origin-Hint: abcd\r\n"));
+
+        // Composition #2: transform_head ran on the assembled head.
+        assert!(head_s.contains("X-Transform: applied\r\n"));
+
+        // Composition #3: body is probe_body followed by chunks in
+        // input order, with no reordering or interleaving.
+        assert_eq!(body, b"ABCDEFGHIJKL");
+    }
+
+    #[tokio::test]
+    async fn stream_range_response_to_propagates_mid_stream_chunk_failure() {
+        // Integration counterpart: the streaming branch must
+        // propagate a mid-stream chunk failure as Err, and the
+        // committed prefix (head + probe + earlier-good chunks)
+        // must already be on the wire so the download client can
+        // resume via Range. Combined with the flush test above,
+        // this gives end-to-end coverage of the failure surface.
+        use futures_util::stream::{self, StreamExt as _};
+        let probe_headers = vec![
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            ("Content-Range".to_string(), "bytes 0-3/12".to_string()),
+        ];
+        let probe_body = b"ABCD";
+        let chunks = stream::iter(vec![
+            (4u64, 7u64, Ok::<Vec<u8>, &'static str>(b"EFGH".to_vec())),
+            (8u64, 11u64, Err::<Vec<u8>, &'static str>("chunk validation failure")),
+        ]);
+        let identity = |head: &[u8]| head.to_vec();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = stream_range_response_to(
+            &mut VecAsyncWriter(&mut buf),
+            &probe_headers,
+            probe_body,
+            12,
+            chunks.map(|x| x),
+            &identity,
+            "https://example.test/big-file",
+        )
+        .await;
+        assert!(result.is_err(), "mid-stream chunk failure must propagate as Err");
+
+        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("head terminator");
+        let body = &buf[sep_pos + 4..];
+        // Committed prefix: probe + first good chunk. NOT the failed
+        // chunk and NOT any "after-failure" chunks (there aren't any
+        // in this test, but the contract is "stop on first error").
+        assert_eq!(body, b"ABCDEFGH");
+    }
+
+    #[tokio::test]
+    async fn stream_chunks_to_writer_aborts_on_chunk_validation_failure() {
+        // Mid-stream chunk failure must return Err *after* the head,
+        // probe body, and earlier successful chunks have been
+        // committed. Single-GET fallback isn't possible at this point
+        // — we've already written wire bytes — and partial write +
+        // Err is what the caller (TLS socket) needs to surface a
+        // Content-Length mismatch to the download client so it
+        // retries via Range from the partial position.
+        use futures_util::stream::{self, StreamExt as _};
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n";
+        let probe = b"AB";
+        let fetches = stream::iter(vec![
+            (2u64, 5u64, Ok::<Vec<u8>, &'static str>(b"CDEF".to_vec())),
+            (6u64, 9u64, Err::<Vec<u8>, &'static str>("Content-Range/body length mismatch")),
+            // This third chunk must NOT be written — the function must
+            // bail on the first Err.
+            (10u64, 11u64, Ok::<Vec<u8>, &'static str>(b"KL".to_vec())),
+        ]);
+        let mut buf = Vec::new();
+        let result = stream_chunks_to_writer(
+            &mut VecAsyncWriter(&mut buf),
+            head,
+            probe,
+            12,
+            fetches.map(|x| x),
+            "https://example.test/file",
+        )
+        .await;
+        assert!(result.is_err(), "must return Err on first chunk failure");
+        // Bytes already committed up to (but not past) the failure:
+        // head + probe + successfully-validated chunk 1.
+        let expected: Vec<u8> = [head.as_slice(), probe.as_slice(), b"CDEF"].concat();
+        assert_eq!(
+            buf, expected,
+            "post-failure chunks must not be written; partial body length tells client to retry"
+        );
+    }
+
+    #[test]
+    fn parse_relay_error_field() {
+        let body = r#"{"e":"unauthorized"}"#;
+        let err = parse_relay_json(body.as_bytes(), true).unwrap_err();
+        assert!(matches!(err, FronterError::Relay(_)));
+    }
+
+    #[test]
+    fn parse_relay_rejects_invalid_body_base64() {
+        let body = r#"{"s":200,"b":"***not-base64***"}"#;
+        let err = parse_relay_json(body.as_bytes(), true).unwrap_err();
+        assert!(matches!(err, FronterError::BadResponse(_)));
+    }
+
+    #[test]
+    fn blacklist_heuristics() {
+        assert!(should_blacklist(429, ""));
+        assert!(should_blacklist(403, "quota"));
+        assert!(should_blacklist(500, "Service invoked too many times per day: urlfetch"));
+        assert!(!should_blacklist(200, ""));
+        assert!(!should_blacklist(502, "bad gateway"));
+        assert!(looks_like_quota_error("Exception: Service invoked too many times per day"));
+        assert!(looks_like_quota_error(
+            "Exception: Bandbreitenkontingent überschritten: https://example.com. Verringern Sie die Datenübertragungsrate."
+        ));
+        assert!(!looks_like_quota_error("bad url"));
+    }
+
+    #[test]
+    fn mask_script_id_hides_middle() {
+        assert_eq!(mask_script_id("short"), "***");
+        assert_eq!(mask_script_id("AKfycbx1234567890abcdef"), "AKfy...cdef");
+    }
+
+    #[test]
+    fn parallel_relay_only_safe_for_idempotent_methods() {
+        // Locks down #743: parallel_relay must never fan-out non-idempotent
+        // methods because Apps Script can't be cancelled mid-request, so
+        // every concurrent attempt completes server-side and side-effects
+        // duplicate at the destination (comment posted twice, etc.).
+        for safe in ["GET", "HEAD", "OPTIONS", "get", "head", "options"] {
+            assert!(
+                is_method_safe_for_fanout(safe),
+                "{} should be safe for fan-out (idempotent per RFC 9110)",
+                safe,
+            );
+        }
+        for unsafe_m in ["POST", "PUT", "PATCH", "DELETE", "post", "put", "patch", "delete"] {
+            assert!(
+                !is_method_safe_for_fanout(unsafe_m),
+                "{} must NOT be safe for fan-out (non-idempotent — duplicate side-effects)",
+                unsafe_m,
+            );
+        }
+        // Unknown methods (CONNECT, TRACE, custom verbs) default to NOT
+        // safe — conservative call, matches the upstream `UrlFetchApp`
+        // lookup behavior.
+        for unknown in ["CONNECT", "TRACE", "PROPFIND", ""] {
+            assert!(
+                !is_method_safe_for_fanout(unknown),
+                "{} must default to NOT safe for fan-out when unrecognised",
+                unknown,
+            );
+        }
+    }
+
+    #[test]
+    fn parse_relay_array_set_cookie() {
+        let body = r#"{"s":200,"h":{"Set-Cookie":["a=1","b=2"]},"b":""}"#;
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.contains("Set-Cookie: a=1\r\n"));
+        assert!(s.contains("Set-Cookie: b=2\r\n"));
+    }
+
+    #[test]
+    fn decode_js_string_escapes_xnn_and_unicode() {
+        // \x7b = '{', \x22 = '"', \x7d = '}', \x5b = '[', \x5d = ']'
+        let inner = r#"\x7b\x22s\x22:200,\x22b\x22:\x22\x22\x7d"#;
+        let out = decode_js_string_escapes(inner).unwrap();
+        assert_eq!(out, r#"{"s":200,"b":""}"#);
+
+        // A = 'A', mixed with literal
+        assert_eq!(decode_js_string_escapes(r"ABC").unwrap(), "ABC");
+
+        // standard escapes
+        assert_eq!(decode_js_string_escapes(r#"a\nb\t\\\"c"#).unwrap(), "a\nb\t\\\"c");
+
+        // truncated escape returns None instead of panicking
+        assert!(decode_js_string_escapes(r"\x7").is_none());
+        assert!(decode_js_string_escapes(r"\u00").is_none());
+    }
+
+    /// Hand-build the `goog.script.init("...", "", undefined)` wrapper for
+    /// a given inner relay JSON, matching the form Apps Script HtmlService
+    /// emits when the deployment uses HtmlService for its response. Every
+    /// `{`/`}` becomes `\x7b`/`\x7d`, every `"` becomes `\"`, every `:`
+    /// stays — that's the realistic subset our unwrapper has to cope with.
+    fn build_goog_script_init_wrapper(inner_relay_json: &str) -> String {
+        // Step 1: build the outer JSON object {"userHtml": "<inner>", ...}
+        // using serde so the inner JSON is properly JSON-escaped (including
+        // each `"` → `\"`).
+        let outer = serde_json::json!({ "userHtml": inner_relay_json });
+        let outer_str = serde_json::to_string(&outer).unwrap();
+        // Step 2: re-escape `{`/`}` → `\xNN` and `"` → `\"` to match the
+        // form Apps Script wraps inside the `goog.script.init("…")`
+        // JS string literal.
+        let mut wire = String::with_capacity(outer_str.len() * 2);
+        for ch in outer_str.chars() {
+            match ch {
+                '{' => wire.push_str(r"\x7b"),
+                '}' => wire.push_str(r"\x7d"),
+                '"' => wire.push_str(r#"\""#),
+                other => wire.push(other),
+            }
+        }
+        format!(
+            "<html><body><script>goog.script.init(\"{}\", \"\", undefined);</script></body></html>",
+            wire
+        )
+    }
+
+    #[test]
+    fn extract_apps_script_user_html_unwraps_goog_init() {
+        let inner_json = r#"{"s":200,"h":{},"b":"aGk="}"#;
+        let wrapped = build_goog_script_init_wrapper(inner_json);
+        let extracted = extract_apps_script_user_html(&wrapped).unwrap();
+        assert_eq!(extracted, inner_json);
+    }
+
+    #[test]
+    fn parse_relay_json_unwraps_goog_script_init() {
+        // End-to-end: an iframe-wrapped body should still parse correctly
+        // through parse_relay_json. Without the unwrap helper this used
+        // to fail with `key must be a string at line 2`.
+        let inner_json = r#"{"s":200,"h":{},"b":""}"#;
+        let wrapped = build_goog_script_init_wrapper(inner_json);
+        let raw = parse_relay_json(wrapped.as_bytes(), true).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.starts_with("HTTP/1.1 200 "), "got: {}", s);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunked_reader_consumes_final_crlf_and_trailers() {
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n0\r\nX-Test: 1\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let (status, _headers, body) = read_http_response(&mut server).await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"Hello");
+
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            .await
+            .unwrap();
+
+        let (status2, _headers2, body2) = read_http_response(&mut server).await.unwrap();
+        assert_eq!(status2, 200);
+        assert_eq!(body2, b"OK");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_length_reader_rejects_truncated_body() {
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHel")
+            .await
+            .unwrap();
+        drop(client);
+
+        let err = read_http_response(&mut server).await.unwrap_err();
+        match err {
+            FronterError::BadResponse(msg) => {
+                assert!(msg.contains("full response body"), "unexpected error: {}", msg);
+            }
+            other => panic!("unexpected error: {}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunked_reader_rejects_truncated_chunk_body() {
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHel")
+            .await
+            .unwrap();
+        drop(client);
+
+        let err = read_http_response(&mut server).await.unwrap_err();
+        match err {
+            FronterError::BadResponse(msg) => {
+                assert!(msg.contains("mid-chunked"), "unexpected error: {}", msg);
+            }
+            other => panic!("unexpected error: {}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunked_reader_rejects_missing_chunk_crlf() {
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHelloXX")
+            .await
+            .unwrap();
+        drop(client);
+
+        let err = read_http_response(&mut server).await.unwrap_err();
+        match err {
+            FronterError::BadResponse(msg) => {
+                assert!(msg.contains("trailing CRLF"), "unexpected error: {}", msg);
+            }
+            other => panic!("unexpected error: {}", other),
+        }
+    }
+
+    // ─── h2 transport ──────────────────────────────────────────────────
+
+    /// Generous response-phase deadline used by transport tests. We
+    /// pick something well above any expected latency on a localhost
+    /// h2c hop so test flakiness can't be confused with a real timeout
+    /// firing. Tests that *want* to observe a timeout pick a small
+    /// value explicitly.
+    const TEST_RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Build a minimal valid `DomainFronter` for unit tests. The
+    /// `connect_host` is unused unless a test actually opens a socket;
+    /// `verify_ssl=true` and a placeholder `google_ip` are fine because
+    /// `DomainFronter::new` doesn't touch the network.
+    fn fronter_for_test(force_http1: bool) -> DomainFronter {
+        let json = format!(
+            r#"{{
+                "mode": "apps_script",
+                "google_ip": "127.0.0.1",
+                "front_domain": "www.google.com",
+                "script_id": "TEST",
+                "auth_key": "test_auth_key",
+                "listen_host": "127.0.0.1",
+                "listen_port": 8085,
+                "log_level": "info",
+                "verify_ssl": true,
+                "force_http1": {}
+            }}"#,
+            force_http1
+        );
+        let cfg: Config = serde_json::from_str(&json).unwrap();
+        DomainFronter::new(&cfg).expect("test fronter must construct")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_http1_disables_h2_at_construction() {
+        // The kill switch: force_http1=true must mark the fronter as
+        // h2-disabled before the first call so ensure_h2 short-circuits
+        // without ever trying ALPN.
+        let fronter = fronter_for_test(true);
+        assert!(
+            fronter.h2_disabled.load(Ordering::Relaxed),
+            "force_http1=true must set h2_disabled at construction"
+        );
+        assert!(
+            fronter.ensure_h2().await.is_none(),
+            "ensure_h2 must return None when h2 is disabled"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_http1_false_leaves_h2_enabled() {
+        let fronter = fronter_for_test(false);
+        assert!(
+            !fronter.h2_disabled.load(Ordering::Relaxed),
+            "default must leave h2 enabled"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn poison_h2_if_gen_is_noop_when_cell_is_empty() {
+        // Defensive: we call poison on every per-request error; cell
+        // may already be None due to a concurrent poison. Must not
+        // panic or wedge.
+        let fronter = fronter_for_test(false);
+        fronter.poison_h2_if_gen(0).await;
+        let cell = fronter.h2_cell.lock().await;
+        assert!(cell.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn poison_h2_if_gen_only_clears_matching_generation() {
+        // Race protection: task A holds gen=1 SendRequest, gen=1 dies,
+        // task B reopens → cell now gen=2 (healthy). Task A's
+        // poison(1) MUST NOT clear gen=2. Without generation matching
+        // the previous code unconditionally cleared the cell, causing
+        // connection churn during recovery.
+        let (addr, server_handle) = spawn_h2c_server(|_req| {
+            let resp = http::Response::builder().status(200).body(()).unwrap();
+            (resp, Vec::new())
+        })
+        .await;
+        let send_v2 = h2c_client(addr).await;
+
+        let fronter = fronter_for_test(false);
+        // Seed the cell with gen=2 (simulating "task B just reopened").
+        {
+            let mut cell = fronter.h2_cell.lock().await;
+            *cell = Some(H2Cell {
+                send: send_v2.clone(),
+                created: Instant::now(),
+                generation: 2,
+                dead: Arc::new(AtomicBool::new(false)),
+            });
+        }
+        // Task A poisons with stale gen=1.
+        fronter.poison_h2_if_gen(1).await;
+        // gen=2 cell must survive.
+        let cell = fronter.h2_cell.lock().await;
+        assert!(
+            cell.is_some(),
+            "poison_h2_if_gen(1) must not clear gen=2 cell"
+        );
+        assert_eq!(cell.as_ref().unwrap().generation, 2);
+        drop(cell);
+
+        // And matching gen=2 actually does clear.
+        fronter.poison_h2_if_gen(2).await;
+        let cell = fronter.h2_cell.lock().await;
+        assert!(cell.is_none(), "poison_h2_if_gen(2) must clear gen=2 cell");
+
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_h2_rejects_dead_cell_within_ttl() {
+        // Cell is within H2_CONN_TTL_SECS but the connection driver
+        // already flipped `dead` (e.g., upstream sent GOAWAY). Without
+        // the dead-flag check `ensure_h2` would happily hand out the
+        // stale SendRequest and the next request would pay a wasted
+        // h2 round trip to discover the breakage. With the check in
+        // place a second pre-existing healthy cell still works fine —
+        // the dead one is replaced via the open-lock path.
+        let (addr, server_handle) = spawn_h2c_server(|_req| {
+            let resp = http::Response::builder().status(200).body(()).unwrap();
+            (resp, Vec::new())
+        })
+        .await;
+        let send = h2c_client(addr).await;
+
+        let fronter = fronter_for_test(false);
+        let dead = Arc::new(AtomicBool::new(true)); // simulate driver having exited
+        {
+            let mut cell = fronter.h2_cell.lock().await;
+            *cell = Some(H2Cell {
+                send,
+                created: Instant::now(), // well within TTL
+                generation: 1,
+                dead: dead.clone(),
+            });
+        }
+
+        // The fast path normally returns Some(send, gen) when the cell
+        // is within TTL. With dead=true it must NOT return the stale
+        // SendRequest. Pre-set the failure-backoff timestamp so
+        // ensure_h2 short-circuits at the backoff check (no network
+        // I/O) regardless of whatever's bound on 127.0.0.1:443 on the
+        // dev/CI host. This isolates the assertion to the new
+        // dead-flag check.
+        *fronter.h2_open_failed_at.lock().await = Some(Instant::now());
+
+        let result = fronter.ensure_h2().await;
+        assert!(
+            result.is_none(),
+            "ensure_h2 must not serve a cell whose driver flipped `dead`"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_h2_skips_reopen_during_failure_backoff() {
+        // After an open failure, ensure_h2 must return None for at
+        // least H2_OPEN_FAILURE_BACKOFF_SECS without attempting a
+        // new handshake — otherwise concurrent callers each pay the
+        // full handshake-timeout cost during an outage.
+        let fronter = fronter_for_test(false);
+        // Simulate a recent open failure.
+        *fronter.h2_open_failed_at.lock().await = Some(Instant::now());
+
+        // ensure_h2 must return None immediately, without trying open_h2
+        // (open_h2 would try TCP-connect to 127.0.0.1:443 which would
+        // either fail slowly or succeed against an unrelated service —
+        // either way, this test would observably take longer if backoff
+        // wasn't honored).
+        let t0 = Instant::now();
+        let result = fronter.ensure_h2().await;
+        assert!(result.is_none(), "must return None during backoff");
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "must return immediately without open attempt; took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// Spawn a minimal local h2c server (plaintext h2, no TLS) on a
+    /// random port. The handler closure builds the response from the
+    /// incoming request — used by `h2_round_trip_*` tests below.
+    /// Returns the bound address and the JoinHandle so the test can
+    /// `abort()` the server when done.
+    async fn spawn_h2c_server<F>(
+        handler: F,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
+    where
+        F: Fn(http::Request<h2::RecvStream>) -> (http::Response<()>, Vec<u8>)
+            + Send
+            + Sync
+            + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = Arc::new(handler);
+        let handle = tokio::spawn(async move {
+            // Single-connection server is enough for these tests.
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(sock).await.unwrap();
+            while let Some(result) = connection.accept().await {
+                let (req, mut respond) = match result {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let (resp, body) = handler(req);
+                let has_body = !body.is_empty();
+                let mut send = respond
+                    .send_response(resp, !has_body)
+                    .expect("send_response in test");
+                if has_body {
+                    send.send_data(Bytes::from(body), true)
+                        .expect("send_data in test");
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Variant that gives the handler async access to the request body
+    /// before producing the response. Needed to assert what the client
+    /// actually sent (rather than relying on the request's existence).
+    async fn spawn_h2c_echo_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(sock).await.unwrap();
+            while let Some(result) = connection.accept().await {
+                let (req, mut respond) = match result {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let mut body = req.into_body();
+                let mut received = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    let n = chunk.len();
+                    received.extend_from_slice(&chunk);
+                    let _ = body.flow_control().release_capacity(n);
+                }
+                let resp = http::Response::builder().status(200).body(()).unwrap();
+                let mut send = respond.send_response(resp, false).unwrap();
+                send.send_data(Bytes::from(received), true).unwrap();
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Open a plaintext h2c connection to `addr` and return a usable
+    /// `SendRequest<Bytes>`. The connection driver is spawned in the
+    /// background and lives for the test's scope.
+    async fn h2c_client(addr: std::net::SocketAddr) -> h2::client::SendRequest<Bytes> {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (send, conn) = h2::client::handshake(stream).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        send
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_round_trip_actually_transmits_post_body() {
+        // Server reads the request body and echoes it. We assert the
+        // server received the exact bytes we passed — proves the
+        // send_data path works, not just that 200 came back.
+        let (addr, server_handle) = spawn_h2c_echo_server().await;
+
+        let send = h2c_client(addr).await;
+        let fronter = fronter_for_test(false);
+        let req_body = b"the-actual-payload-sent-by-h2_round_trip";
+        let (status, _hdrs, echoed) = fronter
+            .h2_round_trip(
+                send,
+                "POST",
+                "/echo",
+                "127.0.0.1",
+                Bytes::from_static(req_body),
+                Some("application/json"),
+                TEST_RESPONSE_DEADLINE,
+            )
+            .await
+            .expect("h2 round trip should succeed");
+        assert_eq!(status, 200);
+        assert_eq!(
+            echoed, req_body,
+            "server must have received the exact bytes we sent"
+        );
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_round_trip_decodes_gzip_responses() {
+        // Mirror the h1 read_http_response behavior: gzip-encoded
+        // bodies must be transparently decompressed before we hand
+        // them back, so downstream JSON parsers see plain bytes
+        // regardless of transport.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let plain = b"{\"hello\":\"world\"}";
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(plain).unwrap();
+        let gzipped = enc.finish().unwrap();
+        let gzipped_arc = Arc::new(gzipped);
+
+        let g = gzipped_arc.clone();
+        let (addr, server_handle) = spawn_h2c_server(move |_req| {
+            let resp = http::Response::builder()
+                .status(200)
+                .header("content-encoding", "gzip")
+                .body(())
+                .unwrap();
+            (resp, (*g).clone())
+        })
+        .await;
+
+        let send = h2c_client(addr).await;
+        let fronter = fronter_for_test(false);
+        let (status, _hdrs, body) = fronter
+            .h2_round_trip(send, "GET", "/", "127.0.0.1", Bytes::new(), None, TEST_RESPONSE_DEADLINE)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, plain, "gzip body must be decoded transparently");
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_h2_relay_with_send_follows_redirect_chain() {
+        // Now exercises run_h2_relay_with_send (the testable inner
+        // of h2_relay_request) so the production redirect loop —
+        // including timeout, RequestSent classification, and per-hop
+        // poison-by-gen — is actually under test, not a hand-rolled
+        // duplicate.
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = counter.clone();
+        let (addr, server_handle) = spawn_h2c_server(move |req| {
+            let n = c.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                let resp = http::Response::builder()
+                    .status(302)
+                    .header("location", "/next")
+                    .body(())
+                    .unwrap();
+                (resp, Vec::new())
+            } else {
+                assert_eq!(req.uri().path(), "/next", "second hop must follow Location");
+                let resp = http::Response::builder().status(200).body(()).unwrap();
+                (resp, b"final".to_vec())
+            }
+        })
+        .await;
+
+        let send = h2c_client(addr).await;
+        let fronter = fronter_for_test(false);
+
+        let (status, _hdrs, body) = fronter
+            .run_h2_relay_with_send(
+                send,
+                /* generation */ 1,
+                "/start",
+                Bytes::new(),
+                TEST_RESPONSE_DEADLINE,
+            )
+            .await
+            .expect("h2 relay should follow redirect to 200");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"final");
+        // Successful round-trip must increment h2_calls.
+        assert_eq!(fronter.h2_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fronter.h2_fallbacks.load(Ordering::Relaxed), 0);
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_h2_relay_with_send_reports_request_sent_no_on_dead_connection() {
+        // Set up an h2c client whose connection is severed before we
+        // call run_h2_relay_with_send. The first `send.ready().await`
+        // inside h2_round_trip should fail — RequestSent::No is the
+        // correct classification (stream never opened on the wire).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            // Accept the connection, do the h2 handshake, then drop.
+            // After drop the client's SendRequest will fail at ready().
+            let (sock, _) = listener.accept().await.unwrap();
+            let _connection = h2::server::handshake(sock).await.unwrap();
+            // Hold briefly so client can complete handshake, then drop.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        let send = h2c_client(addr).await;
+        // Wait for server to drop.
+        server_task.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let fronter = fronter_for_test(false);
+        let result = fronter
+            .run_h2_relay_with_send(
+                send,
+                1,
+                "/x",
+                Bytes::from_static(b"some-body"),
+                TEST_RESPONSE_DEADLINE,
+            )
+            .await;
+        match result {
+            Err((_, RequestSent::No)) => {} // expected
+            Err((e, RequestSent::Maybe)) => {
+                panic!("dead-conn failure classified as Maybe (unsafe to retry): {}", e)
+            }
+            Ok(_) => panic!("expected error against dropped server"),
+        }
+        // Failure must increment h2_fallbacks counter.
+        assert_eq!(fronter.h2_fallbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(fronter.h2_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_h2_relay_with_send_reports_request_sent_maybe_on_post_send_reset() {
+        // Server accepts headers (so the request reaches it) and then
+        // resets the stream. The client sees a stream error AFTER
+        // send_request returned Ok. RequestSent::Maybe is the only
+        // safe classification — Apps Script may have started executing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(sock).await.unwrap();
+            if let Some(Ok((_req, mut respond))) = connection.accept().await {
+                // Reset the stream after receiving headers — simulates
+                // the server starting to process and then bailing
+                // (matches the "Apps Script started UrlFetchApp then
+                // failed" scenario).
+                respond.send_reset(h2::Reason::INTERNAL_ERROR);
+            }
+            // Keep the connection alive briefly so the client sees the
+            // RST_STREAM rather than a connection-level close.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let send = h2c_client(addr).await;
+        let fronter = fronter_for_test(false);
+        let result = fronter
+            .run_h2_relay_with_send(
+                send,
+                1,
+                "/x",
+                Bytes::from_static(b"body"),
+                TEST_RESPONSE_DEADLINE,
+            )
+            .await;
+        match result {
+            Err((_, RequestSent::Maybe)) => {} // expected
+            Err((e, RequestSent::No)) => panic!(
+                "post-send RST classified as No — would let caller \
+                 unsafely replay non-idempotent request: {}",
+                e
+            ),
+            Ok(_) => panic!("expected error against RST_STREAM"),
+        }
+
+        server_task.await.unwrap();
+    }
+
+    // ─── NonRetryable wrapper + retry/fallback policy ────────────────────
+
+    #[test]
+    fn nonretryable_wrapper_is_not_retryable_other_variants_are() {
+        // Surfaces the contract that do_relay_with_retry and the
+        // exit-node fallback rely on. If this ever flips, those
+        // sites would silently start re-issuing post-send failures.
+        let plain = FronterError::Relay("transient".into());
+        assert!(plain.is_retryable(), "plain Relay error must be retryable");
+
+        let plain2 = FronterError::Timeout;
+        assert!(plain2.is_retryable(), "Timeout must be retryable");
+
+        let wrapped = FronterError::NonRetryable(Box::new(FronterError::Relay("post-send".into())));
+        assert!(!wrapped.is_retryable(), "NonRetryable must not be retryable");
+
+        // Display must be transparent so log lines look identical.
+        let inner_msg = "h2 response: stream RST".to_string();
+        let inner = FronterError::Relay(inner_msg.clone());
+        let wrapped = FronterError::NonRetryable(Box::new(inner));
+        let displayed = wrapped.to_string();
+        assert!(
+            displayed.contains(&inner_msg),
+            "transparent Display should surface inner: got {}",
+            displayed
+        );
+
+        // into_inner unwraps once.
+        let inner_again = wrapped.into_inner();
+        assert!(matches!(inner_again, FronterError::Relay(_)));
+        assert!(inner_again.is_retryable(), "unwrapped error is retryable");
+    }
+
+    // Note on test coverage gap: we don't have a deterministic test
+    // that the ready/back-pressure phase's timeout reports
+    // `RequestSent::No`. h2 client enforces remote
+    // `MAX_CONCURRENT_STREAMS` at `send_request` time rather than at
+    // `ready` time, so a "saturate the slots, expect ready to block"
+    // setup actually races down the response-phase path instead.
+    // The ready-arm code in `h2_round_trip` is small (single match
+    // arm with `RequestSent::No` literally written next to the
+    // timeout error) and covered by review. Other safety properties
+    // (post-send Maybe via stream RST, pre-send No via dead conn,
+    // NonRetryable wrap propagation) are covered by the tests above
+    // and below.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_h2_relay_with_send_does_not_wrap_pre_send_in_nonretryable() {
+        // Regression guard: the NonRetryable wrap is the *call site's*
+        // job (do_relay_once_with applies it for unsafe methods only).
+        // run_h2_relay_with_send returns the raw RequestSent::No so
+        // the call site can decide. If h2_relay_request started
+        // wrapping unconditionally, even safe-method requests would
+        // become non-retryable on transient pre-send failures.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _connection = h2::server::handshake(sock).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        let send = h2c_client(addr).await;
+        server_task.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let fronter = fronter_for_test(false);
+        let result = fronter
+            .run_h2_relay_with_send(
+                send,
+                1,
+                "/x",
+                Bytes::from_static(b"x"),
+                TEST_RESPONSE_DEADLINE,
+            )
+            .await;
+        match result {
+            Err((e, RequestSent::No)) => {
+                assert!(
+                    e.is_retryable(),
+                    "pre-send error must be raw FronterError, not pre-wrapped NonRetryable; got {:?}",
+                    e
+                );
+            }
+            other => panic!("expected (Err, RequestSent::No); got {:?}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sticky_disable_h2_for_fronting_refusal_flips_disabled_and_clears_cell() {
+        // Verify the helper that runs from each call site's 421 arm:
+        // sets h2_disabled, clears the cell, rebalances counters
+        // (h2_calls -=1 since the round-trip already counted; h2_fallbacks +=1).
+        // Tests the helper directly so we don't depend on a real h2
+        // server returning 421 — call sites already exercise the
+        // status-match wiring through code review.
+        let (addr, server_handle) = spawn_h2c_server(|_req| {
+            let resp = http::Response::builder().status(200).body(()).unwrap();
+            (resp, Vec::new())
+        })
+        .await;
+        let send = h2c_client(addr).await;
+        let fronter = fronter_for_test(false);
+        // Seed the cell so we can verify it gets cleared.
+        {
+            let mut cell = fronter.h2_cell.lock().await;
+            *cell = Some(H2Cell {
+                send: send.clone(),
+                created: Instant::now(),
+                generation: 7,
+                dead: Arc::new(AtomicBool::new(false)),
+            });
+        }
+        // Pretend a round-trip just incremented h2_calls (which is
+        // what run_h2_relay_with_send does on Ok before the call site
+        // sees the 421 status).
+        fronter.h2_calls.fetch_add(1, Ordering::Relaxed);
+
+        fronter
+            .sticky_disable_h2_for_fronting_refusal(421, "test context")
+            .await;
+
+        assert!(fronter.h2_disabled.load(Ordering::Relaxed), "must sticky-disable");
+        let cell = fronter.h2_cell.lock().await;
+        assert!(cell.is_none(), "cell must be cleared");
+        assert_eq!(
+            fronter.h2_calls.load(Ordering::Relaxed),
+            0,
+            "the h2_calls increment from the failed round-trip must be reversed"
+        );
+        assert_eq!(
+            fronter.h2_fallbacks.load(Ordering::Relaxed),
+            1,
+            "must count as a fallback"
+        );
+        drop(cell);
+
+        // Subsequent ensure_h2 must short-circuit to None without
+        // attempting to open.
+        let t0 = Instant::now();
+        assert!(fronter.ensure_h2().await.is_none());
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "sticky-disabled ensure_h2 must return immediately"
+        );
+
+        // Calling the helper a second time must not log again or
+        // double-count fallbacks beyond +1 per call.
+        fronter
+            .sticky_disable_h2_for_fronting_refusal(421, "test context")
+            .await;
+        // h2_calls would underflow without the saturating guard; assert
+        // it stays at 0.
+        assert_eq!(fronter.h2_calls.load(Ordering::Relaxed), 0);
+        // h2_fallbacks goes up unconditionally (this is "another
+        // attempt that ended up on h1") — that's fine.
+        assert_eq!(fronter.h2_fallbacks.load(Ordering::Relaxed), 2);
+
+        server_handle.abort();
+    }
+
+    #[test]
+    fn is_h2_fronting_refusal_status_only_matches_421() {
+        // Guard against the helper accidentally matching ambiguous
+        // edge statuses (403 could be a real Apps Script geoblock,
+        // 4xx generally is not a "this is h2's fault" signal).
+        assert!(is_h2_fronting_refusal_status(421));
+        for s in [200, 301, 400, 403, 404, 429, 500, 502, 503] {
+            assert!(
+                !is_h2_fronting_refusal_status(s),
+                "status {} must NOT trigger sticky h2 disable",
+                s
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_handshake_post_tls_returns_alpn_refused_when_peer_picks_h1() {
+        // Verify the OpenH2Error::AlpnRefused path: if the TLS layer
+        // negotiated http/1.1 (not h2), the post-TLS helper must
+        // return the typed sentinel that ensure_h2 uses to sticky-
+        // disable. We construct a fake TlsStream by short-circuiting
+        // through a real local TLS server that only advertises h1.
+        //
+        // This needs a real TLS handshake (rustls + a self-signed
+        // cert), so we set up the smallest possible test server with
+        // ALPN forced to ["http/1.1"].
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+        );
+
+        let mut server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        server_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            // Drive the handshake; the test only needs the negotiation
+            // to complete with ALPN=h1. After that we can drop.
+            let _tls = acceptor.accept(sock).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        // Client side: open TLS with ALPN advertising h2 + h1.1; the
+        // server picks h1 → alpn_protocol() returns "http/1.1" not "h2".
+        let mut client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        client_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        let tls = connector.connect(name, tcp).await.unwrap();
+
+        let result = DomainFronter::h2_handshake_post_tls(tls).await;
+        match result {
+            Err(OpenH2Error::AlpnRefused) => {} // expected
+            Err(other) => panic!("expected AlpnRefused, got {:?}", other),
+            Ok((_send, _dead)) => panic!("expected AlpnRefused, got Ok"),
+        }
+        server.await.unwrap();
+    }
+}

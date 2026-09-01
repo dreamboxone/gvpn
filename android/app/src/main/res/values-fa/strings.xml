@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">mhrv-rs</string>
+
+    <!-- Top-bar -->
+    <string name="tb_check_update_checking">در حال بررسی…</string>
+    <string name="tb_version_prefix">نسخهٔ </string>
+
+    <!-- Section headers -->
+    <string name="sec_apps_script_relay">رلهٔ Apps Script</string>
+    <string name="sec_network">شبکه</string>
+    <string name="sec_sni_pool_tester">مجموعهٔ SNI + تستر</string>
+    <string name="sec_advanced">پیشرفته</string>
+    <string name="sec_live_logs">لاگ زنده</string>
+    <string name="sec_how_to_use">راهنمای استفاده</string>
+    <string name="sec_app_splitting">تقسیم برنامه‌ها</string>
+
+    <!-- Primary actions -->
+    <string name="btn_connect">اتصال</string>
+    <string name="btn_disconnect">قطع</string>
+    <string name="btn_install_mitm">نصب گواهی MITM</string>
+    <string name="btn_auto_detect_google_ip">تشخیص خودکار google_ip</string>
+    <string name="btn_test_all">تست همه</string>
+    <string name="btn_test">تست</string>
+    <string name="btn_add">افزودن</string>
+    <string name="btn_clear">پاک</string>
+    <string name="btn_copy">کپی</string>
+    <string name="btn_install">نصب</string>
+    <string name="btn_cancel">انصراف</string>
+
+    <!-- Field labels -->
+    <string name="field_deployment_urls">آدرس‌(های) Deployment یا Script ID</string>
+    <string name="placeholder_paste_ids">یک URL/ID، یا چند مورد با خط جدید/فاصله/ویرگول/نقطه‌ویرگول جدا کنید</string>
+    <string name="field_auth_key">کلید احراز (auth_key)</string>
+    <string name="field_google_ip">google_ip</string>
+    <string name="field_front_domain">دامنهٔ فرانت</string>
+    <string name="field_connection_mode">نوع اتصال</string>
+    <string name="field_add_custom_sni">افزودن SNI سفارشی</string>
+
+    <!-- Connection mode -->
+    <string name="mode_vpn_tun">VPN (TUN) — همهٔ برنامه‌ها رد می‌شوند</string>
+    <string name="mode_proxy_only">فقط پروکسی — تنظیم per-app توسط کاربر</string>
+
+    <!-- App splitting -->
+    <string name="split_all">همهٔ برنامه‌ها</string>
+    <string name="split_only">فقط برنامه‌های انتخاب‌شده</string>
+    <string name="split_except">همه به‌جز برنامه‌های انتخاب‌شده</string>
+    <string name="split_pick_apps">انتخاب برنامه‌ها…</string>
+
+    <!-- Install dialog title -->
+    <string name="dialog_install_mitm_title">نصب گواهی MITM؟</string>
+
+    <!-- Language toggle -->
+    <string name="lang_toggle_cd">تغییر زبان</string>
+
+    <!-- Supporting / helper text -->
+    <string name="help_deployment_urls">URL کامل (https://script.google.com/macros/s/.../exec) یا فقط ID خام. می‌توانید چند مورد را یک‌جا در فیلد افزودن جای‌گذاری کنید — با خط جدید/فاصله/ویرگول/نقطه‌ویرگول جدا می‌شوند. چند ID به‌صورت چرخشی استفاده می‌شوند — بیشتر ID = سرعت بیشتر در حالت تونل کامل.</string>
+    <string name="help_auth_key">همان رمز مشترکی که داخل Apps Script گذاشتید.</string>
+    <string name="help_mode_vpn_tun">هنگام اتصال، مجوز VPN سیستم درخواست می‌شود. تمام ترافیک دستگاه به‌صورت خودکار رد می‌شود.</string>
+    <string name="help_mode_proxy_only">بدون VPN سیستم. بعد از اتصال، پروکسی Wi-Fi را روی 127.0.0.1:%1$d (HTTP) یا %2$d (SOCKS5) تنظیم کنید. فقط برنامه‌هایی که تنظیمات پروکسی را رعایت می‌کنند رد می‌شوند.</string>
+    <string name="help_sni_pool">SNIهای فعال‌شده هنگام اتصال به google_ip به‌صورت چرخشی استفاده می‌شوند. اگر همه را غیرفعال بگذارید، Rust خودکار مجموعهٔ پیش‌فرض گوگل را باز می‌کند.</string>
+    <string name="help_app_splitting">انتخاب کنید چه برنامه‌هایی از VPN استفاده کنند. فقط در حالت VPN (TUN) اعمال می‌شود. برنامهٔ خودمان همیشه مستثنی است تا ترافیک خودش دوباره از تونل رد نشود.</string>
+
+    <!-- SNI pool extras -->
+    <string name="sni_selected_count">%1$d برنامه انتخاب شده</string>
+
+    <!-- Advanced section -->
+    <string name="adv_verify_tls">بررسی TLS طرف مقابل</string>
+    <string name="adv_verify_tls_help">خاموش کردن، بررسی گواهی را برای لبهٔ گوگل غیرفعال می‌کند. فقط برای اشکال‌زدایی کاربرد دارد.</string>
+    <string name="adv_youtube_via_relay">ارسال یوتیوب از طریق رله</string>
+    <string name="adv_youtube_via_relay_help">ترافیک youtube.com / youtu.be / ytimg.com را به‌جای تونل SNI-rewrite از رلهٔ Apps Script عبور می‌دهد. حالت محدود را دور می‌زند ولی پخش ویدیو کندتر می‌شود.</string>
+    <string name="adv_log_level">log_level</string>
+    <string name="adv_parallel_relay">parallel_relay: %1$d</string>
+    <string name="adv_parallel_relay_help">تعداد درخواست‌های موازی هر بار. ۱ عادی است؛ روی لینک‌های با افت، ۲-۳ را امتحان کنید.</string>
+    <string name="adv_upstream_socks5">upstream_socks5 (اختیاری)</string>
+    <string name="adv_upstream_socks5_help">اگر تنظیم شود، ترافیک خروجی از این SOCKS5 رد می‌شود. خالی بگذارید برای اتصال مستقیم.</string>
+
+    <!-- Live logs -->
+    <string name="logs_lines_count">%1$d خط</string>
+
+    <!-- Snackbar -->
+    <string name="snack_google_ip_updated">google_ip به %1$s به‌روزرسانی شد</string>
+    <string name="snack_google_ip_current">google_ip قبلاً به‌روز است (%1$s)</string>
+    <string name="snack_dns_lookup_failed">خطای DNS — اتصال شبکه را بررسی کنید</string>
+    <string name="snack_logs_copied">لاگ‌ها در کلیپ‌بورد کپی شدند</string>
+
+    <!-- Usage today card -->
+    <string name="sec_usage_today">مصرف امروز (تخمینی)</string>
+    <string name="label_calls_today">درخواست‌های امروز</string>
+    <string name="label_bytes_today">بایت امروز</string>
+    <string name="label_pt_day">روز (PT)</string>
+    <string name="label_resets_in">ریست تا</string>
+    <string name="usage_calls_of_quota">%1$d / %2$d  (%3$.1f%%)</string>
+    <string name="usage_resets_hm">%1$d ساعت و %2$d دقیقه</string>
+    <string name="btn_view_quota_on_google">مشاهدهٔ سهمیه در گوگل ←</string>
+    <string name="usage_today_note">تخمینی — این همان چیزی است که از این دستگاه رد شده. عدد دقیق در داشبورد گوگل قابل مشاهده است.</string>
+
+    <!-- "How to use" guide body. Localized — EN copy lives in values. -->
+    <string name="help_how_to_use">۱. یک یا چند آدرس deployment از Apps Script (یا فقط ID خام) و همراه آن auth_key خود را جای‌گذاری کنید.\n۲. روی «نصب گواهی MITM» بزنید و پیام تأیید را قبول کنید — گواهی در Downloads/mhrv-ca.crt ذخیره می‌شود و برنامهٔ Settings باز می‌شود. داخل Settings از نوار جست‌وجو «CA certificate» را پیدا کنید و روی همان نتیجه بزنید (نه «VPN &amp; app user certificate» و نه «Wi-Fi»)، سپس mhrv-ca.crt را از Downloads انتخاب کنید. اگر قفل صفحه ندارید، اندروید می‌خواهد یکی تنظیم کنید (الزام سیستم).\n۳. قبل از Start، بخش «مجموعهٔ SNI + تستر» را باز کنید و «تست همه» را بزنید. اگر همه تایم‌اوت شدند یعنی google_ip در دسترس نیست — آن را با یک IP جایگزین کنید که روی شبکهٔ سالم resolve می‌شود (مثلاً `nslookup www.google.com` روی هر دستگاه سالم).\n۴. Start را بزنید و درخواست VPN را تأیید کنید. پل TUN کامل، تمام برنامه‌های دستگاه را خودکار از پروکسی رد می‌کند — نیاز به تنظیم per-app نیست.\n۵. اگر Chrome پیام «504 Relay timeout» نشان داد: deployment شما پاسخ نمی‌دهد. اسکریپت را دوباره deploy کنید، URL جدید /exec را بگیرید و بالا جای‌گذاری کنید. در «لاگ زنده» ببینید خطا از نوع «Relay timeout» است یا «connect:» — نوع خطا مشخص می‌کند کدام لایه مقصر است.\n\nمحدودیت شناخته‌شده — Cloudflare Turnstile («Verify you are human») روی اکثر سایت‌های پشت Cloudflare به‌طور بی‌پایان loop می‌زند. هر درخواست Apps Script از یک IP خروجی چرخشی دیتاسنتر گوگل + یک User-Agent ثابت «Google-Apps-Script» + اثرانگشت TLS گوگل عبور می‌کند. کوکی cf_clearance به tuple (IP, UA, JA3) مربوط به زمان حل چالش گره خورده است، پس درخواست بعدی — از یک IP خروجی متفاوت — دوباره چالش می‌خورد. این مسئله در این برنامه قابل‌حل نیست؛ ذات رلهٔ Apps Script است. سایت‌هایی که فقط بارگذاری اولیه را gate می‌کنند (نه هر درخواست) بعد از یک بار حل، کار خواهند کرد.</string>
+</resources>

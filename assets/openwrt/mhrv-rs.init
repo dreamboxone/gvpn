@@ -1,0 +1,38 @@
+#!/bin/sh /etc/rc.common
+# OpenWRT procd init script for mhrv-rs.
+# Install as /etc/init.d/mhrv-rs, then:
+#   /etc/init.d/mhrv-rs enable
+#   /etc/init.d/mhrv-rs start
+#
+# Expects:
+#   /usr/bin/mhrv-rs           (the static musl binary from the release)
+#   /etc/mhrv-rs/config.toml   (your config)
+
+START=99
+USE_PROCD=1
+
+BIN=/usr/bin/mhrv-rs
+CONFIG=/etc/mhrv-rs/config.toml
+
+start_service() {
+    [ -x "$BIN" ] || return 1
+    [ -f "$CONFIG" ] || return 1
+
+    procd_open_instance
+    procd_set_param command "$BIN" --config "$CONFIG" --no-cert-check
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param file "$CONFIG"
+    # Issue #8 — OpenWRT's default fd limit is tiny (often 1024 and sometimes
+    # as low as 256 on constrained devices). A browser's parallel sub-resource
+    # burst fills it in seconds and accept(2) starts returning EMFILE. 16k is
+    # plenty for a local proxy and costs virtually no kernel memory.
+    procd_set_param limits nofile="16384 16384"
+    procd_close_instance
+}
+
+reload_service() {
+    stop
+    start
+}

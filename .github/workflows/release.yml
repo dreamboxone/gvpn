@@ -1,0 +1,786 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual re-trigger for the case where one matrix job (e.g. mipsel-softfloat)
+  # failed on the original tag push and we've since pushed the build fix to
+  # main but can't force-move the immutable tag (tag protection rule). Run
+  # this workflow manually with `version` set to the existing release tag —
+  # the build matrix runs against the current main, artifacts are uploaded
+  # to the matching release page, and the release-notes step is a no-op
+  # (release already exists). Pair with `gh variable set
+  # TELEGRAM_NOTIFY_ENABLED --body false` before dispatch if you don't want
+  # the channel re-pinged for what's effectively the same release.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing release tag to upload to (without the leading v). Example: 1.4.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  # `tunnel-docker` job pushes to ghcr.io/therealaleph/mhrv-tunnel-node.
+  # `packages: write` is required by docker/login-action when authenticating
+  # to GHCR with the workflow's auto-provisioned GITHUB_TOKEN. Granted at
+  # the workflow level so the matrix-build job (which doesn't need it) and
+  # the release job (which doesn't need it) both still have a single
+  # well-scoped permissions block.
+  packages: write
+
+# Runner strategy:
+#   - Linux + Android + mipsel:       GitHub-hosted Ubuntu runners.
+#   - macOS arm64 + amd64, Windows:   GitHub-hosted native OS runners.
+#
+# Why hosted: the repo no longer keeps persistent release builders
+# registered. Each release job provisions only the tools it needs, while
+# Swatinem/rust-cache keeps target/ and cargo registry rebuild cost sane.
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pin the runner to Ubuntu 22.04 and use the
+          # x86_64-unknown-linux-gnu target so glibc builds stay compatible
+          # with Ubuntu 22.04 / Debian 12 / Mint 21 / Fedora 36 era systems.
+          # Users behind tight internet who can't dist-upgrade keep working.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            name: mhrv-rs-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            name: mhrv-rs-linux-arm64
+          - target: arm-unknown-linux-gnueabihf
+            os: ubuntu-22.04
+            name: mhrv-rs-raspbian-armhf
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: mhrv-rs-macos-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: mhrv-rs-macos-arm64
+          - target: x86_64-pc-windows-gnu
+            os: windows-latest
+            name: mhrv-rs-windows-amd64
+          # i686-pc-windows-msvc target was attempted in v1.7.7-v1.7.10
+          # to support Windows 7 32-bit users (#272, #318). Removed in
+          # v1.7.11 because keeping it on Rust 1.77.2 (last Win7-stable)
+          # is fundamentally fragile: every transitive crate that bumps
+          # its MSRV (e.g. `time` 0.3.47 needs Cargo manifest features
+          # only available in Rust 1.78+) breaks the build, and pinning
+          # transitives is brittle across releases. Win7 users should
+          # self-build per the README; the project no longer ships a
+          # prebuilt i686 Win7 binary. Replaced by the existing
+          # x86_64-pc-windows-gnu (windows-amd64) which covers ~99% of
+          # active Windows installs (incl. all WoA64 emulation).
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            name: mhrv-rs-linux-musl-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+            name: mhrv-rs-linux-musl-arm64
+          # OpenWRT MT7621 (soft-float mipsel 32-bit). Dozens of cheap
+          # home routers run this chipset and they *specifically* need
+          # the soft-float variant — MT7621 has no hardware FPU and a
+          # hard-float binary segfaults on the first fp op. Tier-3 in
+          # Rust since 1.72; we build it via messense's musl-cross
+          # docker image which still has a mipsel-softfloat toolchain.
+          # `continue-on-error: true` so a regression here doesn't block
+          # the rest of the release. Issue #26.
+          - target: mipsel-unknown-linux-musl
+            os: ubuntu-22.04
+            name: mhrv-rs-openwrt-mipsel-softfloat
+            mipsel_softfloat: true
+
+    runs-on: ${{ matrix.os }}
+    # mipsel-softfloat is best-effort: the Rust tier-3 target occasionally
+    # regresses. Letting it fail keeps the main release going so
+    # desktop/Android users aren't blocked by MT7621 router support.
+    continue-on-error: ${{ matrix.mipsel_softfloat == true }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Skip the host-level rustup install for mipsel-softfloat — that
+      # target is tier-3 in stable Rust (no prebuilt stdlib available
+      # via rustup), and the docker image we use for this build ships
+      # its own Rust toolchain + std. Trying to pass
+      # `targets: mipsel-unknown-linux-musl` to dtolnay/rust-toolchain
+      # errors out with "error: component 'rust-std' for target
+      # 'mipsel-unknown-linux-musl' is unavailable for download", which
+      # fails the job before the docker step ever runs.
+      #
+      # Per-matrix-entry toolchain selection. Default is `stable` (latest)
+      # for every target except where `rust_toolchain` is explicitly pinned
+      # — currently just i686-pc-windows-msvc, which needs 1.77.2 to keep
+      # the Win7 binary loadable (Rust 1.78+ raised Windows MSRV to Win10).
+      - uses: dtolnay/rust-toolchain@master
+        if: matrix.mipsel_softfloat != true
+        with:
+          toolchain: ${{ matrix.rust_toolchain || 'stable' }}
+          targets: ${{ matrix.target }}
+
+      # Cache target/ + cargo registry across runs. cache-bin: false keeps
+      # the cache focused on build artifacts and registry state instead of
+      # pruning tool binaries installed by setup actions.
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.mipsel_softfloat != true
+        with:
+          # Include toolchain in the cache key so a pinned-Rust target
+          # (i686-pc-windows-msvc on 1.77.2) doesn't collide with
+          # stable-Rust caches for other targets, and a future toolchain
+          # bump invalidates only the affected slot.
+          key: ${{ matrix.target }}-${{ matrix.rust_toolchain || 'stable' }}
+          cache-bin: "false"
+
+      # eframe needs a few system libs on Linux for window management,
+      # keyboard, and OpenGL/X11/Wayland. Only the x86_64 GNU Linux job
+      # builds the UI on Linux, so the cross and musl jobs skip this.
+      - name: Install Linux eframe system deps
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libx11-dev \
+            libgl1-mesa-dev libglib2.0-dev libgtk-3-dev
+
+      # Cross-compile toolchains for hosted Ubuntu runners.
+      - name: Install aarch64 cross-compile toolchain (Linux only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p ~/.cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+
+      - name: Install armhf cross-compile toolchain (Linux only)
+        if: matrix.target == 'arm-unknown-linux-gnueabihf'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+          mkdir -p ~/.cargo
+          echo '[target.arm-unknown-linux-gnueabihf]' >> ~/.cargo/config.toml
+          echo 'linker = "arm-linux-gnueabihf-gcc"' >> ~/.cargo/config.toml
+
+      - name: Install Windows MinGW toolchain
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      - name: Configure Windows GNU linker
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        shell: pwsh
+        run: |
+          $gcc = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin\gcc.exe" -replace '\\','/'
+          New-Item -ItemType Directory -Force -Path $env:USERPROFILE/.cargo | Out-Null
+          Add-Content -Path $env:USERPROFILE/.cargo/config.toml -Value '[target.x86_64-pc-windows-gnu]'
+          Add-Content -Path $env:USERPROFILE/.cargo/config.toml -Value "linker = '$gcc'"
+
+      - name: Build CLI
+        if: "!endsWith(matrix.target, '-linux-musl')"
+        run: cargo build --release --target ${{ matrix.target }} --bin mhrv-rs
+
+      # Fully-static musl builds for OpenWRT / Alpine / libc-less systems.
+      # messense/rust-musl-cross ships a pre-built musl toolchain so `ring`
+      # (rustls' crypto backend) cross-compiles cleanly on both archs.
+      - name: Build CLI (musl via docker)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            messense/rust-musl-cross:x86_64-musl \
+            cargo build --release --target x86_64-unknown-linux-musl --bin mhrv-rs
+          sudo chown -R "$(id -u):$(id -g)" target
+
+      - name: Build CLI (musl via docker, arm64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            messense/rust-musl-cross:aarch64-musl \
+            cargo build --release --target aarch64-unknown-linux-musl --bin mhrv-rs
+          sudo chown -R "$(id -u):$(id -g)" target
+
+      # OpenWRT MT7621 / mipsel-softfloat. messense doesn't publish a
+      # `:mipsel-musl-softfloat` tag — the mipsel-musl image is
+      # hardfloat. We build soft-float anyway via
+      # `RUSTFLAGS=-C target-feature=+soft-float` + `-Z build-std` so
+      # libstd itself is recompiled to emit soft-float code. The
+      # gcc/musl shipping in the image is hardfloat but we never link
+      # anything more than libc (`ring` is pure asm for the crypto
+      # that matters), so musl's lack of softfloat libm doesn't bite.
+      # Requires nightly Rust since mipsel is Rust tier 3 in the
+      # stable channel — no prebuilt std.
+      - name: Build CLI (mipsel-softfloat via docker)
+        if: matrix.target == 'mipsel-unknown-linux-musl' && matrix.mipsel_softfloat == true
+        # The inner script is single-quoted so the `#` lines stay as
+        # real comments. An earlier version of this step used
+        # `sh -c "... \` (backslash-continuation inside a
+        # double-quoted YAML folded string) which collapsed into one
+        # line — the first `#` then commented out everything after it,
+        # reducing the whole docker payload to `set -eux;` and failing
+        # silently at the post-docker chown. Heredoc-style single
+        # quotes preserve newlines verbatim; no comment collapse.
+        run: |
+          # Always chown back, even if docker exits non-zero. The previous
+          # form (`docker run …; sudo chown …`) ran chown only on success
+          # because bash -e short-circuits on the docker failure; that
+          # left target/ root-owned for later steps in the same job. The
+          # `trap … EXIT` runs the chown whether docker succeeded or failed,
+          # so a transient mipsel compile regression never poisons the
+          # workspace.
+          set +e
+          trap 'sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true' EXIT
+          docker run --rm -v "$PWD":/src -w /src \
+            -e RUSTFLAGS='-C target-feature=+soft-float' \
+            messense/rust-musl-cross:mipsel-musl \
+            bash -c '
+              set -eux
+              # The image ships a pre-installed nightly that rustup
+              # cannot upgrade in place — `clippy-preview/share/doc/clippy/README.md`
+              # is missing from the pre-bake, and rustup errors with
+              # "failure removing component clippy-preview". Nuke it
+              # first, then install fresh.
+              rustup toolchain uninstall nightly 2>/dev/null || true
+              rustup toolchain install nightly --profile minimal
+              rustup component add rust-src --toolchain nightly
+              cargo +nightly build --release \
+                -Z build-std=std,panic_abort \
+                --target mipsel-unknown-linux-musl \
+                --bin mhrv-rs
+            '
+          rc=$?
+          # `trap … EXIT` will fire the chown on shell exit — the explicit
+          # exit here just propagates the docker exit code as the step
+          # status (success vs continue-on-error path).
+          exit $rc
+
+      # UI build: we try to build the UI binary on every platform. If it fails
+      # on cross-compile for linux-arm64 (missing arm64 system libs cross),
+      # we still ship the CLI. We also skip the UI on musl targets (OpenWRT etc.
+      # are headless, bundling X11 makes no sense).
+      - name: Build UI
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'arm-unknown-linux-gnueabihf' && !endsWith(matrix.target, '-linux-musl')
+        run: cargo build --release --target ${{ matrix.target }} --features ui --bin mhrv-rs-ui
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/mhrv-rs dist/mhrv-rs
+          chmod +x dist/mhrv-rs
+          if [ -f target/${{ matrix.target }}/release/mhrv-rs-ui ]; then
+            cp target/${{ matrix.target }}/release/mhrv-rs-ui dist/mhrv-rs-ui
+            chmod +x dist/mhrv-rs-ui
+          fi
+          # OpenWRT / musl archives get the procd init script instead of run.sh,
+          # since routers don't have a CA to install and run headless via procd.
+          case "${{ matrix.target }}" in
+            *-linux-musl)
+              cp assets/openwrt/mhrv-rs.init dist/mhrv-rs.init
+              chmod +x dist/mhrv-rs.init
+              ;;
+            *)
+              cp assets/launchers/run.sh dist/run.sh
+              chmod +x dist/run.sh
+              if [ "${{ runner.os }}" = "macOS" ]; then
+                cp assets/launchers/run.command dist/run.command
+                chmod +x dist/run.command
+              fi
+              ;;
+          esac
+
+      - name: Build macOS .app bundle
+        if: runner.os == 'macOS'
+        run: |
+          # Tag push: $GITHUB_REF == "refs/tags/v1.4.0", strip "refs/tags/v".
+          # workflow_dispatch: inputs.version comes in as e.g. "1.4.0".
+          # Fall back to ref_name (the bare branch/tag name) and strip a
+          # possible leading "v" so both paths produce the bare version.
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          ./assets/macos/build-app.sh dist/mhrv-rs-ui "$VER" dist
+          # Make a clean zip of just the .app for the release
+          cd dist
+          zip -qry "${{ matrix.name }}-app.zip" mhrv-rs.app
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/mhrv-rs.exe dist/mhrv-rs.exe
+          if (Test-Path target/${{ matrix.target }}/release/mhrv-rs-ui.exe) {
+            Copy-Item target/${{ matrix.target }}/release/mhrv-rs-ui.exe dist/mhrv-rs-ui.exe
+          }
+          Copy-Item assets/launchers/run.bat dist/run.bat
+
+      - name: Make archive
+        shell: bash
+        run: |
+          cd dist
+          case "${{ matrix.target }}" in
+            *-pc-windows-*)
+              7z a -tzip "${{ matrix.name }}.zip" mhrv-rs.exe mhrv-rs-ui.exe run.bat
+              ;;
+            *-apple-darwin)
+              tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs-ui run.sh run.command
+              ;;
+            *-linux-musl)
+              tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs.init
+              ;;
+            *)
+              tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs-ui run.sh 2>/dev/null || tar czf "${{ matrix.name }}.tar.gz" mhrv-rs run.sh
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ matrix.name }}.tar.gz
+            dist/${{ matrix.name }}.zip
+            dist/${{ matrix.name }}-app.zip
+          if-no-files-found: ignore
+
+  # Android build — separate job so it doesn't inflate the matrix. The
+  # Rust side here cross-compiles to FOUR ABIs (arm64-v8a, armeabi-v7a,
+  # x86_64, x86) via cargo-ndk and drops the .so files into the Gradle
+  # project's jniLibs/ tree, which then packages them into a single
+  # universal APK. Users pick it once, no per-ABI split.
+  android:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/26.2.11394342
+      ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/26.2.11394342
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      # Cache cargo + target/ across Android release builds. Four cargo-ndk
+      # release builds back-to-back with LTO is where the cold cost comes
+      # from; rust-cache brings warm runs down to ~3–4 min from ~9 min cold.
+      # cache-bin: false — see the rationale on the matrix build job above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-universal
+          cache-bin: "false"
+          # cargo-ndk writes into `target/<android-triple>/release/`, all
+          # four of which we want to cache.
+          workspaces: |
+            . -> target
+
+      - name: Install Android NDK and cargo-ndk
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.2.11394342"
+          cargo install cargo-ndk --locked
+
+      # `./gradlew :app:assembleRelease` triggers cargoBuildRelease first
+      # which invokes cargo-ndk with all four targets, then Gradle packages
+      # the APK (release buildType signed with the committed release.jks —
+      # see android/app/build.gradle.kts comment explaining why).
+      - name: Build release APK
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Rename APKs with version
+        working-directory: android
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          mkdir -p ../dist
+
+          # With splits.abi enabled in build.gradle.kts (issue #136), AGP
+          # emits:
+          #   app-universal-release.apk       — all 4 ABIs bundled (~50 MB)
+          #   app-arm64-v8a-release.apk       — modern 64-bit ARM (~15 MB)
+          #   app-armeabi-v7a-release.apk     — older 32-bit ARM
+          #   app-x86_64-release.apk          — emulator on Intel Macs / Chromebook
+          #   app-x86-release.apk             — legacy 32-bit Intel emulator
+          #
+          # We publish all of them so users behind narrow / flaky
+          # censorship tunnels can grab the per-ABI APK that matches
+          # their device (~15 MB) instead of the ~50 MB universal.
+          # Universal stays named `mhrv-rs-android-universal-v*.apk` so
+          # existing download links and Telegram mirrors keep working.
+          declare -A ABI_TO_OUTNAME=(
+            ["universal"]="mhrv-rs-android-universal-v${VER}.apk"
+            ["arm64-v8a"]="mhrv-rs-android-arm64-v8a-v${VER}.apk"
+            ["armeabi-v7a"]="mhrv-rs-android-armeabi-v7a-v${VER}.apk"
+            ["x86_64"]="mhrv-rs-android-x86_64-v${VER}.apk"
+            ["x86"]="mhrv-rs-android-x86-v${VER}.apk"
+          )
+
+          missing=0
+          for abi in "${!ABI_TO_OUTNAME[@]}"; do
+            SRC="app/build/outputs/apk/release/app-${abi}-release.apk"
+            if [ -f "$SRC" ]; then
+              cp "$SRC" "../dist/${ABI_TO_OUTNAME[$abi]}"
+              ls -la "../dist/${ABI_TO_OUTNAME[$abi]}"
+            else
+              echo "::warning::missing expected APK: $SRC"
+              missing=$((missing + 1))
+            fi
+          done
+
+          # Require at least the universal — if that's missing something
+          # is genuinely broken and we should fail loud rather than ship
+          # a partial release.
+          if [ ! -f "../dist/mhrv-rs-android-universal-v${VER}.apk" ]; then
+            echo "::error::universal APK missing; actual outputs:"
+            find app/build/outputs/apk -type f -name '*.apk' -print
+            exit 1
+          fi
+          if [ "$missing" -gt 0 ]; then
+            echo "::warning::$missing per-ABI APK(s) missing; continuing with universal + whatever built"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mhrv-rs-android-universal
+          path: dist/*.apk
+          if-no-files-found: error
+
+  # Build + publish the tunnel-node Docker image to GHCR. Issue: every
+  # full-mode user has to set up tunnel-node on a VPS, and "rustup +
+  # cargo build --release" on a 1GB VPS is non-trivial — fails on memory,
+  # takes 8+ minutes if it works, blocks anyone without Rust experience.
+  # A prebuilt multi-arch image makes deployment a one-liner:
+  #   docker run -d -p 8080:8080 -e TUNNEL_AUTH_KEY=... \
+  #     ghcr.io/therealaleph/mhrv-tunnel-node:latest
+  #
+  # Tags published per release:
+  #   v1.5.0       — exact version pin
+  #   1.5          — auto-following minor
+  #   latest       — most recent release (skipped on workflow_dispatch
+  #                  re-publishes; see `latest` condition below)
+  #
+  # Build platforms: linux/amd64 and linux/arm64. Most VPS providers
+  # (DigitalOcean, Hetzner, Oracle Free Tier) offer arm64 instances at
+  # half price, and the binary works on both.
+  tunnel-docker:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Compute the version string the same way the rest of the workflow
+      # does: tag pushes get it from github.ref_name (e.g. "v1.5.0"),
+      # workflow_dispatch from the explicit `inputs.version` (e.g.
+      # "1.5.0"). Strip a possible leading "v" so the docker tag namespace
+      # is consistent: `:1.5.0`, not `:v1.5.0`.
+      - name: Compute version
+        id: ver
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          MINOR="${VER%.*}"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "minor=${MINOR}" >> "$GITHUB_OUTPUT"
+          echo "Building docker for v${VER} (minor: ${MINOR})"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build for both amd64 and arm64. `:latest` is only updated on
+      # actual tag pushes — workflow_dispatch re-runs on an existing
+      # version (e.g. for the v1.4.0 mipsel republish) shouldn't move
+      # the latest pointer.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./tunnel-node
+          file: ./tunnel-node/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/mhrv-tunnel-node:${{ steps.ver.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/mhrv-tunnel-node:${{ steps.ver.outputs.minor }}
+            ${{ github.event_name == 'push' && format('ghcr.io/{0}/mhrv-tunnel-node:latest', github.repository_owner) || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # release + telegram: lightweight aggregation jobs on GitHub-hosted
+  # ubuntu-latest. They only download artifacts and call APIs.
+  release:
+    needs: [build, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # `actions/download-artifact@v4` has been intermittently flaking on
+      # this workflow with "5 retries exhausted" on a single artifact (~10
+      # of 13). Wrap it in a manual retry — usually the second attempt
+      # succeeds, the third nails any laggards. We use `gh run download`
+      # against the current run so we don't depend on the release page
+      # existing yet (it doesn't until the softprops step below runs).
+      - name: Download all build artifacts (with retries)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          for attempt in 1 2 3; do
+            if gh run download "${GITHUB_RUN_ID}" --dir dist --repo "${GITHUB_REPOSITORY}"; then
+              echo "downloaded all artifacts on attempt $attempt"
+              # `gh run download` puts each artifact in its own subdir;
+              # flatten so downstream steps that expect dist/<file> work
+              # the same as `merge-multiple: true` did.
+              find dist -type f -mindepth 2 -exec mv -f {} dist/ \;
+              find dist -type d -empty -delete
+              ls -la dist/
+              exit 0
+            fi
+            echo "download attempt $attempt failed; retrying in 30s..."
+            sleep 30
+          done
+          echo "::error::failed to download artifacts after 3 attempts"
+          exit 1
+
+      # Compose the GitHub release body from `docs/changelog/v<ver>.md`
+      # so the Releases page tells humans what actually changed —
+      # `generate_release_notes: true` alone produces "Full Changelog:
+      # …compare/v1.x.0...v1.x.1" which is empty when no PRs landed
+      # between tags (e.g. for fix-forward releases like v1.4.1). The
+      # changelog file already exists for every release in our format
+      # (Persian section, then `---`, then English section); we wrap it
+      # with a header and append the auto-generated commit list at the
+      # bottom by NOT setting body_path and instead setting body
+      # directly to changelog_content + (the existing
+      # generate_release_notes flag handles the trailing comparison
+      # link automatically).
+      - name: Compose release body
+        id: relbody
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          CHANGELOG="docs/changelog/v${VER}.md"
+          if [ ! -f "$CHANGELOG" ]; then
+            echo "::warning::no changelog at $CHANGELOG; release body will fall back to generate_release_notes only"
+            echo "has_changelog=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'body<<__RELEASE_BODY_EOF__'
+            # Strip leading HTML comment blocks (single-line OR multi-line)
+            # so the GitHub Release page sees only the body content, not
+            # the file-format header comment that every changelog has.
+            # Also strips any leading whitespace/blank lines that follow.
+            #
+            # Quoted heredoc (`<<'PY'`) so backticks/$ in the python
+            # snippet aren't shell-interpolated; CHANGELOG is passed in
+            # as an env var on the python invocation rather than via
+            # `$CHANGELOG` interpolation inside the heredoc.
+            CHANGELOG_PATH="$CHANGELOG" python3 - <<'PY'
+          import os, re, pathlib
+          body = pathlib.Path(os.environ["CHANGELOG_PATH"]).read_text(encoding="utf-8")
+          print(re.sub(r"^\s*(?:<!--.*?-->\s*)+", "", body, count=1, flags=re.S), end="")
+          PY
+            echo
+            echo '__RELEASE_BODY_EOF__'
+          } >> "$GITHUB_OUTPUT"
+          echo "has_changelog=true" >> "$GITHUB_OUTPUT"
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # On tag push, action-gh-release defaults tag_name to the
+          # current ref. On workflow_dispatch the ref is `main` (or
+          # whichever branch we dispatched from), which would create a
+          # bogus release named "main"; force the tag explicitly so
+          # artifacts upload to the existing release identified by
+          # `inputs.version`. The leading `v` is preserved (release
+          # tags are `v1.4.0`, not `1.4.0`).
+          tag_name: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+          files: dist/*
+          # Append auto-generated comparison link AFTER our changelog
+          # body — `append_body: true` puts our body first, then the
+          # auto notes. If no changelog file existed, body is empty and
+          # the auto notes carry the whole release-page content (same
+          # behavior as before this change).
+          body: ${{ steps.relbody.outputs.body }}
+          append_body: true
+          generate_release_notes: true
+
+  # Refresh the in-repo `releases/` folder with the latest pre-built
+  # artifacts so users behind GitHub-Releases-page filtering (the IR
+  # state network filters the dynamic /releases/ URL but not the static
+  # `Code → Download ZIP` of the source tree) can still download.
+  # Practice was started pre-v1.1.0, dropped, then resumed at user
+  # request after a Telegram-channel suggestion: "فقط داخل پوشه ریلیز
+  # پروژه اپلود بکن — مشکل دانلود حل میشه — راحت میشه از گیتهاب دانلود
+  # کرد." The folder holds ONLY the latest version (replace, not
+  # archive); each tag refresh overwrites the previous artifacts. The
+  # existing release-page workflow keeps versioned artifacts behind
+  # `https://github.com/.../releases/tag/v...` for users who can reach
+  # that URL — this in-repo folder is the fallback for users who can't.
+  commit-releases:
+    needs: [build, android, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Always check out main, not the tag — we're committing back to
+      # the moving branch. fetch-depth 0 so `git push origin HEAD:main`
+      # has the lineage to fast-forward.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # Pull artifacts from the GitHub Release page (which the `release`
+      # job populated a few seconds earlier) rather than the workflow
+      # artifacts API. The artifacts API path —
+      # `actions/download-artifact@v4` with `merge-multiple: true` —
+      # has been failing with "artifact download failed after 5
+      # retries" on one of the ~13 artifacts on multiple consecutive
+      # runs (v1.7.5 retrigger, v1.7.6). The 10 fast downloads that
+      # complete first all succeed; the 11th-13th hit the error.
+      # `gh release download` reads from GitHub's Release-page CDN,
+      # which is independent of the artifacts blob store and has a
+      # different retry / rate-limit profile. Same files, more
+      # reliable surface.
+      - name: Download artifacts from the GitHub Release page
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version || github.ref_name }}"
+          # Strip leading `v` to normalize, then re-add — the Release
+          # tag is `vX.Y.Z`, but for the rest of the workflow we use
+          # bare `X.Y.Z`. Mirror the same pattern here so a downstream
+          # readme update can use the bare version.
+          VER="${VER#v}"
+          mkdir -p artifacts
+          gh release download "v${VER}" \
+            --repo "${{ github.repository }}" \
+            --dir artifacts \
+            --pattern '*.tar.gz' \
+            --pattern '*.zip' \
+            --pattern '*.apk'
+          echo "--- artifacts/ contents ---"
+          ls -la artifacts/
+
+      - name: Refresh releases/ folder
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+
+          mkdir -p releases
+
+          # Wipe old binary artifacts (.apk, .tar.gz, .zip) but keep
+          # README.md and .gitattributes — those are folder-level docs
+          # that stay constant across versions and shouldn't be
+          # regenerated on every release.
+          find releases -maxdepth 1 -type f \
+            \( -name '*.apk' -o -name '*.tar.gz' -o -name '*.zip' \) \
+            -delete
+
+          # Copy desktop archives. Their names already include the
+          # platform identifier (mhrv-rs-linux-amd64.tar.gz, etc.) and
+          # are version-stable — no rename needed.
+          for f in artifacts/*.tar.gz artifacts/*.zip; do
+            [ -f "$f" ] || continue
+            cp "$f" "releases/$(basename "$f")"
+          done
+
+          # Android APKs come with the version baked into the name
+          # (mhrv-rs-android-universal-v1.7.5.apk). Copy all of them so
+          # users on slow connections can grab a per-ABI APK (~37 MB)
+          # instead of the universal (~110 MB).
+          for f in artifacts/mhrv-rs-android-*.apk; do
+            [ -f "$f" ] || continue
+            cp "$f" "releases/$(basename "$f")"
+          done
+
+          # Update the "Current version" line in releases/README.md
+          # (both English and Persian copies) and APK filename refs so
+          # the doc stays accurate. `sed -i` BSD/GNU compatibility is
+          # handled by passing an empty extension explicitly — runner
+          # is Linux so `-i` alone works, but the empty-string form
+          # also works on macOS for anyone running this locally.
+          if [ -f releases/README.md ]; then
+            sed -i.bak \
+              -e "s/Current version: \*\*v[0-9][0-9.]*\*\*/Current version: **v${VER}**/" \
+              -e "s/نسخهٔ فعلی: \*\*v[0-9][0-9.]*\*\*/نسخهٔ فعلی: **v${VER}**/" \
+              -e "s/mhrv-rs-android-universal-v[0-9][0-9.]*\.apk/mhrv-rs-android-universal-v${VER}.apk/g" \
+              releases/README.md
+            rm -f releases/README.md.bak
+          fi
+
+          echo "--- releases/ contents after refresh ---"
+          ls -la releases/
+
+      - name: Commit + push to main
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add releases
+          if git diff --cached --quiet; then
+            echo "No releases/ changes to commit (artifacts identical to current HEAD?)."
+            exit 0
+          fi
+
+          git commit -m "chore(releases): refresh prebuilt binaries for v${VER}" \
+                     -m "Auto-committed by release workflow so users behind GitHub-Releases-page filtering can download via the in-repo releases/ folder. The GitHub Release page itself still has the canonical versioned artifacts; this folder is the fallback path for users who can only reach the static source tree (Code → Download ZIP)."
+
+          # Push to main. The release workflow runs on the tag commit,
+          # which is reachable from main as a fast-forward — push is
+          # straightforward, no force needed. Tag protection rules
+          # apply to refs/tags/* not refs/heads/main, so this push
+          # isn't gated by the same protection.
+          git push origin HEAD:main
+
+  # The legacy `telegram` job that posted a universal APK + changelog
+  # bundle to the main Telegram channel was removed in v1.9.4. It was
+  # superseded by `.github/workflows/telegram-publish-files.yml` (per-
+  # platform per-file posts to the files channel + a single cross-link
+  # to the main channel). With both running together, every release
+  # produced a duplicate APK post on the main channel — the legacy
+  # bundled post AND the new cross-link.
+  #
+  # If you ever need to bring back the bundled-APK-on-main pattern, the
+  # commit history before v1.9.4 has the full job — `git log -- .github/workflows/release.yml`.
+  # The `TELEGRAM_NOTIFY_ENABLED` repo variable + `telegram_release_notify.py`
+  # script that the legacy job called are no longer referenced.
