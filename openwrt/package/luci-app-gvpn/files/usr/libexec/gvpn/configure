@@ -1,0 +1,73 @@
+#!/bin/sh
+
+set -eu
+
+mode=$(uci -q get gvpn.main.mode || echo apps_script)
+script_ids=$(uci -q export gvpn 2>/dev/null | awk -F "'" '
+/^[[:space:]]*list script_ids / {
+	if ($2 !~ /^[A-Za-z0-9_-]+$/) exit 1
+	print $2
+}')
+if [ -z "$script_ids" ]; then
+	legacy_script_id=$(uci -q get gvpn.main.script_id || true)
+	if [ -n "$legacy_script_id" ]; then script_ids=$legacy_script_id; fi
+fi
+auth_key=$(uci -q get gvpn.main.auth_key || true)
+listen_host=$(uci -q get gvpn.main.listen_host || echo 0.0.0.0)
+listen_port=$(uci -q get gvpn.main.listen_port || echo 8085)
+socks5_port=$(uci -q get gvpn.main.socks5_port || echo 8086)
+lan_proxy_enabled=$(uci -q get gvpn.main.lan_proxy_enabled || echo 0)
+verify_ssl=$(uci -q get gvpn.main.verify_ssl || echo 1)
+log_level=$(uci -q get gvpn.main.log_level || echo info)
+
+case "$mode" in
+	apps_script|full|direct) ;;
+	*) echo "unsupported mode: $mode" >&2; exit 1 ;;
+esac
+
+if [ "$mode" != direct ]; then
+	[ -n "$script_ids" ] || { echo "At least one Apps Script deployment ID is required" >&2; exit 1; }
+	[ -n "$auth_key" ] || { echo "Apps Script auth key is required" >&2; exit 1; }
+	for script_id in $script_ids; do
+		case "$script_id" in *[!A-Za-z0-9_-]*) echo "deployment ID contains unsupported characters" >&2; exit 1 ;; esac
+	done
+	case "$auth_key" in *[!A-Za-z0-9._~+/=-]*) echo "auth key contains unsupported characters" >&2; exit 1 ;; esac
+fi
+
+case "$listen_host" in 127.0.0.1|0.0.0.0) ;; *) echo "listen host must be 127.0.0.1 or 0.0.0.0" >&2; exit 1 ;; esac
+case "$listen_port:$socks5_port" in *[!0-9:]*) echo "ports must be numeric" >&2; exit 1 ;; esac
+case "$log_level" in error|warn|info|debug|trace) ;; *) echo "unsupported log level" >&2; exit 1 ;; esac
+case "$verify_ssl" in 0|1) ;; *) echo "verify_ssl must be 0 or 1" >&2; exit 1 ;; esac
+case "$lan_proxy_enabled" in 0|1) ;; *) echo "lan_proxy_enabled must be 0 or 1" >&2; exit 1 ;; esac
+if [ "$lan_proxy_enabled" = 1 ] && [ "$mode" != full ]; then
+	echo "automatic LAN routing requires Full mode; deploy CodeFull.gs and configure tunnel-node first" >&2
+	exit 1
+fi
+
+valid_port() {
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+valid_port "$listen_port" || { echo "HTTP port is out of range" >&2; exit 1; }
+valid_port "$socks5_port" || { echo "SOCKS5 port is out of range" >&2; exit 1; }
+[ "$listen_port" != "$socks5_port" ] || { echo "HTTP and SOCKS5 ports must differ" >&2; exit 1; }
+
+mkdir -p /var/run/gvpn
+tmp=/var/run/gvpn/config.toml.tmp
+{
+	printf '[relay]\nmode = "%s"\n' "$mode"
+	if [ "$mode" != direct ]; then
+		printf 'script_ids = ['
+		separator=''
+		for script_id in $script_ids; do
+			printf '%s"%s"' "$separator" "$script_id"
+			separator=', '
+		done
+		printf ']\nauth_key = "%s"\n' "$auth_key"
+	fi
+	printf '\n[network]\ngoogle_ip = "216.239.38.120"\nfront_domain = "www.google.com"\n'
+	printf 'listen_host = "%s"\nlisten_port = %s\nsocks5_port = %s\n' "$listen_host" "$listen_port" "$socks5_port"
+	if [ "$verify_ssl" = 1 ]; then printf 'verify_ssl = true\n'; else printf 'verify_ssl = false\n'; fi
+	printf '\n[network.hosts]\n\n[scan]\n\n[logging]\nlog_level = "%s"\n\n[exit_node]\nenabled = false\n' "$log_level"
+} > "$tmp"
+chmod 600 "$tmp"
+mv "$tmp" /var/run/gvpn/config.toml

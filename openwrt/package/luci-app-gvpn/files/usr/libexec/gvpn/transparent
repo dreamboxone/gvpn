@@ -1,0 +1,183 @@
+#!/bin/sh
+
+set -eu
+
+ACTION=${1:-start}
+RULE_MARK=0x4756
+RULE_MASK=0xffff
+TABLE=4756
+RULES=/usr/share/nftables.d
+TABLE_RULE=${RULES}/table-pre/90-gvpn.nft
+SINGBOX_CONFIG=/var/run/gvpn/sing-box.json
+DNS_STATE=/etc/gvpn/tproxy-dns.state
+DNS4=8.8.8.8
+DNS6=2001:4860:4860::8888
+
+dns_restore() {
+	[ -f "$DNS_STATE" ] || return 0
+	while IFS="$(printf '\t')" read -r kind section value; do
+		[ -n "$section" ] || continue
+		case "$kind" in
+			v4-added) uci -q del_list "dhcp.${section}.dhcp_option=${value}" || true ;;
+			v6-added) uci -q del_list "dhcp.${section}.dns=${value}" || true ;;
+			ra-added) uci -q delete "dhcp.${section}.dns_service" || true ;;
+		esac
+	done < "$DNS_STATE"
+	while IFS="$(printf '\t')" read -r kind section value; do
+		[ -n "$section" ] || continue
+		case "$kind" in
+			v4-old) uci -q add_list "dhcp.${section}.dhcp_option=${value}" || true ;;
+			v6-old) uci -q add_list "dhcp.${section}.dns=${value}" || true ;;
+			ra-old) uci -q set "dhcp.${section}.dns_service=${value}" || true ;;
+		esac
+	done < "$DNS_STATE"
+	uci commit dhcp
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+	/etc/init.d/odhcpd reload >/dev/null 2>&1 || true
+	rm -f "$DNS_STATE"
+}
+
+dns_apply() {
+	local state_tmp section network_name device value old found
+	mkdir -p /etc/gvpn
+	state_tmp=${DNS_STATE}.tmp
+	: > "$state_tmp"
+	chmod 0600 "$state_tmp"
+	mv "$state_tmp" "$DNS_STATE"
+	found=0
+	for section in $(uci -q show dhcp | sed -n "s/^dhcp\\.\\([A-Za-z0-9_]*\\)=dhcp$/\\1/p"); do
+		network_name=$(uci -q get "dhcp.${section}.interface" || true)
+		[ -n "$network_name" ] || continue
+		device=$(uci -q get "network.${network_name}.device" || uci -q get "network.${network_name}.ifname" || true)
+		case " $devices " in *" $device "*) ;; *) continue ;; esac
+		found=1
+		while IFS= read -r value; do
+			case "$value" in 6,*)
+				printf 'v4-old\t%s\t%s\n' "$section" "$value" >> "$DNS_STATE"
+				uci -q del_list "dhcp.${section}.dhcp_option=${value}" || return 1
+				;;
+			esac
+		done <<EOF
+$(uci -q show "dhcp.${section}.dhcp_option" | sed -n "s/^dhcp\\.${section}\\.dhcp_option='\\(.*\\)'$/\\1/p")
+EOF
+		printf 'v4-added\t%s\t6,%s\n' "$section" "$DNS4" >> "$DNS_STATE"
+		uci -q add_list "dhcp.${section}.dhcp_option=6,${DNS4}" || return 1
+
+		while IFS= read -r value; do
+			[ -n "$value" ] || continue
+			printf 'v6-old\t%s\t%s\n' "$section" "$value" >> "$DNS_STATE"
+			uci -q del_list "dhcp.${section}.dns=${value}" || return 1
+		done <<EOF
+$(uci -q show "dhcp.${section}.dns" | sed -n "s/^dhcp\\.${section}\\.dns='\\(.*\\)'$/\\1/p")
+EOF
+		printf 'v6-added\t%s\t%s\n' "$section" "$DNS6" >> "$DNS_STATE"
+		uci -q add_list "dhcp.${section}.dns=${DNS6}" || return 1
+
+		old=$(uci -q get "dhcp.${section}.dns_service" || true)
+		if [ -n "$old" ]; then printf 'ra-old\t%s\t%s\n' "$section" "$old" >> "$DNS_STATE"
+		else printf 'ra-added\t%s\n' "$section" >> "$DNS_STATE"; fi
+		uci -q set "dhcp.${section}.dns_service=1" || return 1
+	done
+	[ "$found" = 1 ] || { echo "no DHCP section matches the selected LAN devices; refusing TPROXY to avoid DNS leaks" >&2; return 1; }
+	uci commit dhcp || return 1
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+	/etc/init.d/odhcpd reload >/dev/null 2>&1 || true
+}
+
+remove_rules() {
+	rm -f "$TABLE_RULE"
+	while ip rule del fwmark "$RULE_MARK/$RULE_MASK" lookup "$TABLE" 2>/dev/null; do :; done
+	while ip -6 rule del fwmark "$RULE_MARK/$RULE_MASK" lookup "$TABLE" 2>/dev/null; do :; done
+	ip route del local 0.0.0.0/0 dev lo table "$TABLE" 2>/dev/null || true
+	ip -6 route del local ::/0 dev lo table "$TABLE" 2>/dev/null || true
+	dns_restore
+}
+
+case "$ACTION" in
+stop)
+	remove_rules
+	if command -v fw4 >/dev/null 2>&1; then fw4 reload >/dev/null 2>&1 || true; fi
+	exit 0
+	;;
+start) ;;
+*) echo "usage: $0 {start|stop}" >&2; exit 2 ;;
+esac
+
+enabled=$(uci -q get gvpn.main.lan_proxy_enabled || echo 0)
+[ "$enabled" = 1 ] || { remove_rules; fw4 reload >/dev/null 2>&1 || true; exit 0; }
+mode=$(uci -q get gvpn.main.mode || echo apps_script)
+[ "$mode" = full ] || { echo "LAN transparent routing requires Full mode and CodeFull.gs" >&2; exit 1; }
+socks5_port=$(uci -q get gvpn.main.socks5_port || echo 8086)
+
+mkdir -p "$(dirname "$TABLE_RULE")" /var/run/gvpn
+devices=$(uci -q export gvpn | awk -F "'" '/^[[:space:]]*list lan_devices / { print $2 }')
+[ -n "$devices" ] || devices=br-lan
+
+tmp=${TABLE_RULE}.tmp
+{
+	printf 'chain gvpn_tproxy {\n\ttype filter hook prerouting priority mangle; policy accept;\n\tmeta mark %s/%s return\n' "$RULE_MARK" "$RULE_MASK"
+	for device in $devices; do
+		case "$device" in *[!A-Za-z0-9_.:-]*) echo "invalid LAN device name: $device" >&2; exit 1 ;; esac
+		printf '\tiifname "%s" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 } return\n' "$device"
+		printf '\tiifname "%s" ip6 daddr { ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001:db8::/32, fc00::/7, fe80::/10, ff00::/8 } return\n' "$device"
+		printf '\tiifname "%s" meta l4proto { tcp, udp } tproxy to :1536 meta mark set %s accept\n' "$device" "$RULE_MARK"
+	done
+	printf '}\n'
+} > "$tmp"
+chmod 0644 "$tmp"
+mv "$tmp" "$TABLE_RULE"
+if ! fw4 check >/dev/null 2>&1; then
+	remove_rules
+	echo "fw4 rejected GVPN transparent rules; rules were rolled back" >&2
+	exit 1
+fi
+ip route replace local 0.0.0.0/0 dev lo table "$TABLE"
+ip rule add fwmark "$RULE_MARK/$RULE_MASK" lookup "$TABLE" priority 10476 2>/dev/null || true
+ip -6 route replace local ::/0 dev lo table "$TABLE" 2>/dev/null || true
+ip -6 rule add fwmark "$RULE_MARK/$RULE_MASK" lookup "$TABLE" priority 10476 2>/dev/null || true
+if ! fw4 reload >/dev/null 2>&1; then
+	remove_rules
+	fw4 reload >/dev/null 2>&1 || true
+	echo "firewall reload failed; GVPN transparent rules were rolled back" >&2
+	exit 1
+fi
+
+cat > "$SINGBOX_CONFIG" <<'JSON'
+{
+	"log": { "level": "info", "timestamp": true },
+	"inbounds": [
+		{
+			"type": "tproxy",
+			"tag": "gvpn-lan",
+			"listen": "::",
+			"listen_port": 1536,
+			"sniff": true,
+			"sniff_override_destination": true
+		}
+	],
+	"outbounds": [
+		{ "type": "socks", "tag": "gvpn-socks", "server": "127.0.0.1", "server_port": 8086, "version": "5" }
+	],
+	"route": {
+		"rules": [ { "inbound": [ "gvpn-lan" ], "outbound": "gvpn-socks" } ],
+		"final": "gvpn-socks"
+	}
+}
+JSON
+sed "s/\"server_port\": 8086/\"server_port\": ${socks5_port}/" "$SINGBOX_CONFIG" > "${SINGBOX_CONFIG}.tmp"
+mv "${SINGBOX_CONFIG}.tmp" "$SINGBOX_CONFIG"
+
+if ! sing-box check -c "$SINGBOX_CONFIG" >/dev/null 2>&1; then
+	remove_rules
+	fw4 reload >/dev/null 2>&1 || true
+	echo "sing-box rejected the generated configuration; rules were rolled back" >&2
+	exit 1
+fi
+
+dns_restore
+if ! dns_apply; then
+	remove_rules
+	fw4 reload >/dev/null 2>&1 || true
+	echo "could not configure LAN DNS for transparent routing; rules were rolled back" >&2
+	exit 1
+fi

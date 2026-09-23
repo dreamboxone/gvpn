@@ -1,0 +1,10 @@
+#!/bin/sh
+
+running=false
+autostart=false
+transparent=false
+
+if /etc/init.d/gvpn status >/dev/null 2>&1; then running=true; fi
+if [ -L /etc/rc.d/S99gvpn ]; then autostart=true; fi
+if [ "$(uci -q get gvpn.main.lan_proxy_enabled || echo 0)" = 1 ] && pidof sing-box >/dev/null 2>&1; then transparent=true; fi
+printf '{"running":%s,"autostart":%s,"transparent":%s}\n' "$running" "$autostart" "$transparent"

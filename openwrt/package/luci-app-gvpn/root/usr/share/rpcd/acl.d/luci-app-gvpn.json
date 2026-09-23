@@ -1,0 +1,30 @@
+{
+  "luci-app-gvpn": {
+    "description": "Manage GVPN proxy service",
+    "read": {
+      "uci": [ "gvpn" ],
+      "ubus": {
+        "service": [ "list" ],
+        "uci": [ "get" ],
+        "file": [ "exec" ]
+      },
+      "file": {
+        "/usr/libexec/gvpn/status": [ "exec" ]
+      }
+    },
+    "write": {
+      "uci": [ "gvpn" ],
+      "ubus": {
+        "uci": [ "add", "set", "delete", "order", "apply", "confirm" ],
+        "file": [ "exec" ]
+      },
+      "file": {
+        "/etc/init.d/gvpn start": [ "exec" ],
+        "/etc/init.d/gvpn stop": [ "exec" ],
+        "/etc/init.d/gvpn restart": [ "exec" ],
+        "/etc/init.d/gvpn enable": [ "exec" ],
+        "/etc/init.d/gvpn disable": [ "exec" ]
+      }
+    }
+  }
+}
