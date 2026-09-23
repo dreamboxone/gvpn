@@ -6,7 +6,7 @@
 
 ## نیازمندی‌ها و سازگاری
 
-- رابط **firewall4/nftables** (OpenWrt 22.03 به بعد)؛ بسته، `sing-box-tiny`، `kmod-nft-tproxy` و `ip-full` را به‌عنوان وابستگی اعلام می‌کند.
+- رابط **firewall4/nftables** (OpenWrt 22.03 به بعد)؛ بسته، `sing-box`، `kmod-nft-tproxy` و `ip-full` را به‌عنوان وابستگی اعلام می‌کند.
 - OpenWrt مبتنی بر APK: فایل `.apk` متناسب با SDK و معماری همان روتر. OpenWrt 24.10 و قدیمی‌تر معمولاً IPK/opkg دارد و این APK را نباید روی آن نصب کرد.
 - فایل‌های داخل `dist/openwrt` فقط برای معماری‌ای معتبرند که با SDK آن ساخته شده‌اند. ARMv7 و AArch64 فایل جداگانه می‌خواهند. باینری AArch64 روی CPUهای 64 بیتی سازگار ARMv8/ARMv9 قابل اجراست؛ این به معنی سازگاری APK با هر firmware یا هر kernel نیست.
 - در وضعیت فعلی آزمون ساخت، هدف شناخته‌شدهٔ پروژه `ipq40xx/chromium` با `arm_cortex-a7_neon-vfpv4` است. برای هدف دیگر، SDK رسمی همان target/release را استفاده کنید؛ وابستگی‌های کرنل باید دقیقاً با firmware روتر هماهنگ باشند.

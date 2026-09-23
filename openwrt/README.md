@@ -6,7 +6,7 @@
 
 ## Requirements and compatibility
 
-- OpenWrt using **firewall4/nftables** (OpenWrt 22.03 or newer). The package declares `sing-box-tiny`, `kmod-nft-tproxy`, and `ip-full` as dependencies.
+- OpenWrt using **firewall4/nftables** (OpenWrt 22.03 or newer). The package declares `sing-box`, `kmod-nft-tproxy`, and `ip-full` as dependencies.
 - OpenWrt builds using APK: install the `.apk` built for the router's exact SDK and package architecture. OpenWrt 24.10 and older generally use IPK/opkg; do not install this APK there.
 - Artifacts under `dist/openwrt` are specific to the architecture used to build them. ARMv7 and AArch64 need separate builds. The AArch64 binary targets the generic 64-bit ARM ABI and can run on compatible ARMv8/ARMv9 CPUs, but that does not make the APK compatible with every firmware or kernel.
 - The project's known initial test target is `ipq40xx/chromium`, package architecture `arm_cortex-a7_neon-vfpv4`. For other targets, use that target/release's official SDK; kernel dependencies must match the router firmware exactly.

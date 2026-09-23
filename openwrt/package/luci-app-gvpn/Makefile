@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-gvpn
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=dreamboxone
 
@@ -14,7 +14,7 @@ define Package/luci-app-gvpn
   SUBMENU:=3. Applications
   TITLE:=GVPN Google relay proxy
   PKGARCH:=$(ARCH_PACKAGES)
-  DEPENDS:=+luci-base +rpcd-mod-file +firewall4 +sing-box-tiny +kmod-nft-tproxy +ip-full
+  DEPENDS:=+luci-base +rpcd-mod-file +firewall4 +sing-box +kmod-nft-tproxy +ip-full
 endef
 
 define Package/luci-app-gvpn/description
