@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-gvpn
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=dreamboxone
 
@@ -27,6 +27,7 @@ GVPN_BINARY?=$(firstword $(wildcard $(CURDIR)/prebuilt/$(ARCH_PACKAGES)/gvpn $(T
 define Build/Prepare
 	$(call Build/Prepare/Default)
 	$(CP) ./htdocs $(PKG_BUILD_DIR)/htdocs
+	$(CP) ./resources $(PKG_BUILD_DIR)/resources
 	$(CP) ./files $(PKG_BUILD_DIR)/files
 	@test -n "$(GVPN_BINARY)" -a -f "$(GVPN_BINARY)" || (echo "GVPN binary is missing for $(ARCH_PACKAGES)" >&2; exit 1)
 	$(CP) "$(GVPN_BINARY)" $(PKG_BUILD_DIR)/gvpn
@@ -47,9 +48,12 @@ define Package/luci-app-gvpn/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/usr/libexec/gvpn/status $(1)/usr/libexec/gvpn/status
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/usr/libexec/gvpn/transparent $(1)/usr/libexec/gvpn/transparent
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/gvpn
-	sed 's#gvpn/settings#gvpn/$(VIEW)#' ./htdocs/luci-static/resources/view/gvpn/settings.js \
+	sed -e 's#gvpn/settings#gvpn/$(VIEW)#' -e 's#__GVPN_VERSION__#$(PKG_VERSION)-r$(PKG_RELEASE)#g' ./htdocs/luci-static/resources/view/gvpn/settings.js \
 		> $(1)/www/luci-static/resources/view/gvpn/$(VIEW).js
 	chmod 0644 $(1)/www/luci-static/resources/view/gvpn/$(VIEW).js
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/gvpn
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/resources/Vazirmatn-wght.woff2 $(1)/www/luci-static/resources/gvpn/Vazirmatn-wght.woff2
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/resources/OFL.txt $(1)/www/luci-static/resources/gvpn/OFL.txt
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	sed 's#gvpn/settings#gvpn/$(VIEW)#' ./root/usr/share/luci/menu.d/luci-app-gvpn.json \
 		> $(1)/usr/share/luci/menu.d/luci-app-gvpn.json

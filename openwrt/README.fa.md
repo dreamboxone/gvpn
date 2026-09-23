@@ -1,6 +1,6 @@
 # GVPN برای OpenWrt
 
-`luci-app-gvpn` بستهٔ گرافیکی GVPN است. رابط فارسی آن در **LuCI → Services → GVPN** قرار دارد و موتور، تنظیمات، سرویس و هدایت شفاف LAN را مدیریت می‌کند. دستگاه‌های شبکه برای حالت TPROXY نیازی به واردکردن پراکسی ندارند.
+`luci-app-gvpn` بستهٔ گرافیکی GVPN است. رابط فارسی آن در **LuCI → Services → GVPN Manager** قرار دارد و موتور، تنظیمات، سرویس و هدایت شفاف LAN را مدیریت می‌کند. دستگاه‌های شبکه برای حالت TPROXY نیازی به واردکردن پراکسی ندارند.
 
 > برای Full و هدایت LAN باید `CodeFull.gs` را به‌عنوان Web App در Google Apps Script منتشر کنید و `tunnel-node` را روی VPS یا Google Cloud Run اجرا کنید. این دو جزء بیرون از روتر اجرا می‌شوند. Apps Script معمولی برای عبور همهٔ TCP/UDP کافی نیست.
 
@@ -24,6 +24,8 @@ apk add --allow-untrusted /tmp/luci-app-gvpn-*.apk
 ## گرفتن اطلاعات Apps Script
 
 در این پروژه «کلید گوگل» کلید Google Cloud API نیست. دو مقدار لازم است: یک `AUTH_KEY` محرمانهٔ مشترک و یک یا چند شناسهٔ Deployment از Web App.
+
+> دسترسی به [script.google.com](https://script.google.com/) ممکن است فیلتر باشد. برای بازکردن پنل Google Apps Script و ساخت یا مدیریت Deployment، ابتدا با فیلترشکن به این نشانی وارد شوید.
 
 1. فایل [`assets/apps_script/CodeFull.gs`](../assets/apps_script/CodeFull.gs) را در Apps Script بسازید/جایگزین کنید. مقدار قوی و تصادفی `AUTH_KEY` در کد را انتخاب کنید و برای تنظیم پنل نگه دارید.
 2. در Apps Script گزینهٔ **Deploy → New deployment → Web app** را بزنید. برای برنامهٔ اجراشونده با حساب خودتان، گزینهٔ اجرا به‌صورت **Me** و دسترسی Web App را مطابق راهنمای CodeFull/امنیت حساب تنظیم کنید؛ این برنامه از هر کسی که URL را بداند محافظت نمی‌شود مگر آنکه `AUTH_KEY` قوی باشد.

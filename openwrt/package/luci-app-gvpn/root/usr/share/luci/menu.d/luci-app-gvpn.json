@@ -1,6 +1,6 @@
 {
   "admin/services/gvpn": {
-    "title": "مدیریت GVPN",
+    "title": "GVPN Manager",
     "order": 85,
     "action": {
       "type": "view",

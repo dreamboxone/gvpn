@@ -1,6 +1,6 @@
 # GVPN for OpenWrt
 
-`luci-app-gvpn` is the graphical OpenWrt package for GVPN. Its Persian LuCI page is under **Services → GVPN** and manages the relay engine, configuration, service, and transparent LAN routing. Client devices do not need proxy settings when LAN TPROXY is enabled.
+`luci-app-gvpn` is the graphical OpenWrt package for GVPN. Its LuCI page is under **Services → GVPN Manager** and manages the relay engine, configuration, service, and transparent LAN routing. Client devices do not need proxy settings when LAN TPROXY is enabled.
 
 > Full mode and LAN routing require a deployed `CodeFull.gs` Web App plus a `tunnel-node` running on a VPS or Google Cloud Run. These components run outside the router. The regular Apps Script relay alone cannot carry arbitrary TCP/UDP traffic.
 

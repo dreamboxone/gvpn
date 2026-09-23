@@ -83,7 +83,31 @@ return view.extend({
 			});
 		}
 
-		var m = new form.Map('gvpn', _('GVPN'));
+		var m = new form.Map('gvpn', 'GVPN Manager');
+		var saveForm = m.save;
+		m.save = function(callback, silent) {
+			return saveForm.call(this, callback, true).catch(function(err) {
+				if (!silent) {
+					var detail = err && err.message ? err.message : String(err);
+					var modal = ui.showModal('خطا در ذخیره‌سازی', [
+						E('div', { 'dir': 'rtl', 'lang': 'fa', 'style': 'font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif;text-align:right' }, [
+							E('p', {}, 'ذخیرهٔ تنظیمات انجام نشد:'),
+							E('p', {}, [ E('em', { 'style': 'white-space:pre-wrap' }, detail) ]),
+							E('div', { 'class': 'right' }, [
+								E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, 'بستن')
+							])
+						])
+					]);
+					var modalTitle = modal.querySelector('h4');
+					modalTitle.setAttribute('dir', 'rtl');
+					modalTitle.setAttribute('lang', 'fa');
+					modalTitle.style.fontFamily = 'GVPN-Vazirmatn,Vazirmatn,sans-serif';
+					modalTitle.style.textAlign = 'right';
+				}
+
+				return Promise.reject(err);
+			});
+		};
 		var s = m.section(form.NamedSection, 'main', 'gvpn', _('تنظیمات پراکسی'));
 		s.anonymous = true;
 
@@ -144,8 +168,9 @@ return view.extend({
 
 		var panel = E('div', { 'class': 'gvpn-dashboard' }, [
 			E('style', {}, '.gvpn-dashboard{--gvpn-accent:#2474e5;--gvpn-ink:#17233b;--gvpn-muted:#62718a;max-width:1120px;margin:18px auto 24px;color:var(--gvpn-ink)}.gvpn-hero{position:relative;overflow:hidden;padding:28px 32px;border-radius:18px;background:linear-gradient(120deg,#102947,#155c9d 62%,#3186e5);color:#fff;box-shadow:0 14px 34px rgba(22,71,122,.22)}.gvpn-hero:after{content:"";position:absolute;width:210px;height:210px;border:1px solid rgba(255,255,255,.18);border-radius:50%;right:8%;top:-118px;box-shadow:0 0 0 28px rgba(255,255,255,.05),0 0 0 58px rgba(255,255,255,.035)}.gvpn-hero h2{margin:0 0 8px;color:#fff;font-size:26px}.gvpn-hero p{position:relative;z-index:1;margin:0;max-width:680px;color:#e2efff;line-height:1.9}.gvpn-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:16px 0}.gvpn-card{padding:18px 20px;border:1px solid rgba(91,119,158,.16);border-radius:14px;background:var(--background-color-high,#fff);box-shadow:0 5px 18px rgba(22,42,76,.055)}.gvpn-card h3{margin:0 0 12px;font-size:15px}.gvpn-stat{display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--gvpn-muted)}.gvpn-card code{direction:ltr;display:inline-block;max-width:100%;overflow-wrap:anywhere;color:#254f82}.gvpn-actions{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}.gvpn-actions .cbi-button{border-radius:9px;padding:7px 14px}.gvpn-note{padding:12px 15px;border-radius:10px;background:#eef5ff;color:#315780;line-height:1.8}.gvpn-dashboard .label{padding:5px 9px;border-radius:20px}.gvpn-dashboard+ .cbi-map-descr{line-height:1.8}@media(max-width:600px){.gvpn-hero{padding:22px}.gvpn-hero h2{font-size:22px}.gvpn-card{padding:15px}}'),
+			E('style', {}, '@font-face{font-family:GVPN-Vazirmatn;src:url(/luci-static/resources/gvpn/Vazirmatn-wght.woff2) format("woff2");font-style:normal;font-weight:100 900;font-display:swap}.gvpn-page{direction:rtl;font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif}.gvpn-page button,.gvpn-page input,.gvpn-page textarea{font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif}.gvpn-page input,.gvpn-page code{direction:ltr;text-align:left}.gvpn-hero h2{display:flex;align-items:center;gap:12px;direction:ltr;justify-content:flex-end}.gvpn-version{padding:4px 9px;border:1px solid rgba(255,255,255,.35);border-radius:999px;background:rgba(255,255,255,.12);font-size:13px;font-weight:600}'),
 			E('div', { 'class': 'gvpn-hero' }, [
-				E('h2', {}, _('GVPN برای OpenWrt')),
+				E('h2', {}, [ 'GVPN Manager', E('span', { 'class': 'gvpn-version', 'dir': 'ltr' }, 'v__GVPN_VERSION__') ]),
 				E('p', {}, _('مدیریت یکپارچهٔ رلهٔ گوگل، کلیدها و هدایت شفاف شبکهٔ محلی. تنظیمات را یک‌بار انجام دهید؛ دستگاه‌های LAN به تنظیم پراکسی نیاز ندارند.'))
 			]),
 			E('div', { 'class': 'gvpn-cards' }, [
@@ -184,7 +209,7 @@ return view.extend({
 		poll.add(refresh, 5);
 
 		return m.render().then(function(formNode) {
-			return E('div', { 'class': 'cbi-map' }, [ panel, formNode ]);
+			return E('div', { 'class': 'cbi-map gvpn-page', 'dir': 'rtl', 'lang': 'fa' }, [ panel, formNode ]);
 		});
 	}
 });
