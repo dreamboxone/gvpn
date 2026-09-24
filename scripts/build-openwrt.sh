@@ -77,7 +77,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-make -C "${SDK_ROOT}" CONFIG_PACKAGE_luci-app-gvpn=y package/luci-app-gvpn/compile
+# The SDK scanned its package metadata before this package was copied in, so
+# it does not know the package exists yet and `package/*/compile` would be a
+# silent no-op. Drop the cached scan and select the package in .config —
+# passing CONFIG_PACKAGE_... as a make variable alone is not enough on 24.10.
+rm -f "${SDK_ROOT}/tmp/.packageinfo" "${SDK_ROOT}/tmp/.packagedeps"
+sed -i '/^# CONFIG_PACKAGE_luci-app-gvpn is not set$/d; /^CONFIG_PACKAGE_luci-app-gvpn=/d' "${SDK_ROOT}/.config"
+echo 'CONFIG_PACKAGE_luci-app-gvpn=m' >> "${SDK_ROOT}/.config"
+make -C "${SDK_ROOT}" defconfig >/dev/null
+grep -Fqx 'CONFIG_PACKAGE_luci-app-gvpn=m' "${SDK_ROOT}/.config" \
+	|| fail "SDK did not keep luci-app-gvpn selected after defconfig"
+
+make -C "${SDK_ROOT}" package/luci-app-gvpn/compile
 
 mapfile -t BUILT_PACKAGES < <(find "${SDK_ROOT}/bin/packages/${EXPECTED_ARCH}" -type f \
 	-name "luci-app-gvpn-*.${PKG_EXT}" -print)

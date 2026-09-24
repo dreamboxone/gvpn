@@ -161,13 +161,16 @@ return view.extend({
 
 		var verify = s.option(form.Flag, 'verify_ssl', _('بررسی گواهی‌های TLS'));
 		verify.default = '1';
+		verify.rmempty = false;
 
 		var lanProxy = s.option(form.Flag, 'lan_proxy_enabled', _('هدایت خودکار ترافیک LAN با TPROXY'));
 		lanProxy.default = '0';
+		lanProxy.rmempty = false;
 		lanProxy.description = _('در Apps Script فقط وب روی TCP/80 و TCP/443 هدایت می‌شود و UDP/443 برای بازگشت مرورگر از QUIC به HTTPS معمولی مسدود می‌شود. برای دامنه‌هایی که DNS شبکه رکورد A آن‌ها را حذف می‌کند (مانند یوتیوب) یک آدرس IPv4 ثابت روی dnsmasq تنظیم و پاسخ‌های AAAA فیلتر می‌شوند تا ترافیک وارد TPROXY شود؛ با خاموش‌کردن این گزینه همه به حالت قبل برمی‌گردد. HTTPS روی دستگاه کاربر به اعتماد به CA روتر نیاز دارد و همهٔ برنامه‌ها سازگار نیستند. در Full، TCP/UDP از تونل عبور می‌کند و DNSهای DHCP شبکهٔ انتخابی موقتاً تغییر می‌کنند.');
 
 		var autostart = s.option(form.Flag, 'autostart', _('اجرای خودکار هنگام روشن‌شدن روتر'));
 		autostart.default = '0';
+		autostart.rmempty = false;
 		autostart.description = _('با تیک‌زدن و ذخیرهٔ تنظیمات، سرویس پس از هر راه‌اندازی روتر خودکار اجرا می‌شود. بدون تیک، شروع سرویس فقط دستی است.');
 
 		var lanDevices = s.option(form.DynamicList, 'lan_devices', _('رابط‌های LAN برای هدایت'));

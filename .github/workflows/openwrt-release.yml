@@ -136,7 +136,10 @@ jobs:
           if-no-files-found: error
 
   release:
+    # Publish whatever built. A format that fails should not withhold the
+    # packages that are fine, so this does not depend on every matrix entry.
     needs: build
+    if: always()
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -158,8 +161,16 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match package $tag" >&2
             exit 1
           fi
-          test "$(find release -maxdepth 1 -name '*.apk' | wc -l)" -eq 3
-          test "$(find release -maxdepth 1 -name '*.ipk' | wc -l)" -eq 3
+          apks=$(find release -maxdepth 1 -name '*.apk' | wc -l)
+          ipks=$(find release -maxdepth 1 -name '*.ipk' | wc -l)
+          echo "built $apks APK(s) and $ipks IPK(s)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$apks" -eq 0 ] && [ "$ipks" -eq 0 ]; then
+            echo "No packages were built; nothing to publish" >&2
+            exit 1
+          fi
+          if [ "$apks" -ne 3 ] || [ "$ipks" -ne 3 ]; then
+            echo "Incomplete matrix: $apks/3 APKs, $ipks/3 IPKs" >> "$GITHUB_STEP_SUMMARY"
+          fi
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" release/* --clobber
           else
