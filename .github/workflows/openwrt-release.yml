@@ -73,12 +73,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang libssl-dev pkg-config zstd curl git python3
           rustup target add '${{ matrix.rust_target }}'
+      # The cross-compiled release build is the expensive part of this job
+      # (full LTO over ~500 crates on a 2-core runner), so cache both the
+      # SDK tarball and the cargo output keyed on the target.
+      - name: Cache OpenWrt SDK tarball
+        uses: actions/cache@v4
+        with:
+          path: sdk.tar.zst
+          key: sdk-${{ matrix.sdk }}
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/${{ matrix.rust_target }}
+          key: cargo-${{ matrix.rust_target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.rust_target }}-
       - name: Download matching OpenWrt SDK
         shell: bash
         run: |
           set -euo pipefail
           url="https://downloads.openwrt.org/releases/${{ matrix.release }}/targets/${{ matrix.target }}/${{ matrix.sdk }}"
-          curl --fail --location --retry 5 --retry-all-errors --output sdk.tar.zst "$url"
+          if [ ! -f sdk.tar.zst ]; then
+            curl --fail --location --retry 5 --retry-all-errors --output sdk.tar.zst "$url"
+          fi
           printf '%s  %s\n' '${{ matrix.sha256 }}' sdk.tar.zst | sha256sum --check
           mkdir sdk
           tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
