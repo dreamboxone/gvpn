@@ -8,6 +8,12 @@ ARCH="$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\([^"]*\)"$/\1/p' "${SDK_ROOT}/.
 [[ -n "${ARCH}" ]] || { echo "Unable to read package architecture from SDK" >&2; exit 1; }
 DIST_DIR="${REPO_ROOT}/dist/openwrt/${ARCH}"
 APK="${SDK_ROOT}/staging_dir/host/bin/apk"
+# 25.x SDKs emit APK, 24.10 and older emit IPK.
+if grep -Fqx 'CONFIG_USE_APK=y' "${SDK_ROOT}/.config"; then
+	PKG_EXT="apk"
+else
+	PKG_EXT="ipk"
+fi
 PKG_VERSION="$(sed -n 's/^PKG_VERSION:=\(.*\)$/\1/p' "${REPO_ROOT}/openwrt/package/luci-app-gvpn/Makefile" | tr -d '\r')"
 PKG_RELEASE="$(sed -n 's/^PKG_RELEASE:=\(.*\)$/\1/p' "${REPO_ROOT}/openwrt/package/luci-app-gvpn/Makefile" | tr -d '\r')"
 CHECK_DIR="$(mktemp -d)"
@@ -22,17 +28,24 @@ python3 -m json.tool "${REPO_ROOT}/openwrt/package/luci-app-gvpn/root/usr/share/
 python3 -m json.tool "${REPO_ROOT}/openwrt/package/luci-app-gvpn/root/usr/share/rpcd/acl.d/luci-app-gvpn.json" >/dev/null
 
 shopt -s nullglob
-PACKAGES=("${DIST_DIR}/luci-app-gvpn-${PKG_VERSION}-r${PKG_RELEASE}"*.apk)
-[[ "${#PACKAGES[@]}" -eq 1 ]] || { echo "Expected one luci-app-gvpn ${PKG_VERSION}-r${PKG_RELEASE} APK" >&2; exit 1; }
-if compgen -G "${DIST_DIR}/gvpn-*.apk" >/dev/null; then
-	echo "Unexpected separate gvpn APK found" >&2
+PACKAGES=("${DIST_DIR}/luci-app-gvpn-${PKG_VERSION}-r${PKG_RELEASE}"*."${PKG_EXT}")
+[[ "${#PACKAGES[@]}" -eq 1 ]] || { echo "Expected one luci-app-gvpn ${PKG_VERSION}-r${PKG_RELEASE} ${PKG_EXT^^}" >&2; exit 1; }
+if compgen -G "${DIST_DIR}/gvpn-*.${PKG_EXT}" >/dev/null; then
+	echo "Unexpected separate gvpn package found" >&2
 	exit 1
 fi
 
 for package in "${PACKAGES[@]}"; do
 	package_dir="${CHECK_DIR}/$(basename "${package}")"
 	mkdir -p "${package_dir}"
-	"${APK}" extract --allow-untrusted --destination "${package_dir}" "${package}"
+	if [[ "${PKG_EXT}" == apk ]]; then
+		"${APK}" extract --allow-untrusted --destination "${package_dir}" "${package}"
+	else
+		tar -xf "${package}" -C "${package_dir}"
+		data_tar="$(find "${package_dir}" -maxdepth 1 -name 'data.tar*' -print -quit)"
+		[[ -n "${data_tar}" ]] || { echo "${package} has no data payload" >&2; exit 1; }
+		tar -xf "${data_tar}" -C "${package_dir}"
+	fi
 done
 
 APP_DIR="${CHECK_DIR}/$(basename "${PACKAGES[0]}")"

@@ -18,9 +18,3 @@ pub mod logging;
 pub mod update_check;
 
 pub use quota_tracker::QuotaSummary;
-
-#[cfg(target_os = "android")]
-pub mod android_jni;
-
-#[cfg(target_os = "ios")]
-pub mod ios_ffi;

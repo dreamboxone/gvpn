@@ -1,55 +1,167 @@
-# GVPN Manager for OpenWrt
+# GVPN Manager برای OpenWrt
 
-`luci-app-gvpn` adds a graphical GVPN manager to OpenWrt LuCI. The default setup uses Google Apps Script as a manually configured web proxy, without a VPS. Optional Full mode can transparently route LAN TCP/UDP through TPROXY when a separate tunnel-node is available.
+`luci-app-gvpn` یک مدیر گرافیکی GVPN به LuCI اضافه می‌کند. حالت پیش‌فرض از **Google Apps Script** به‌عنوان رله‌ی وب استفاده می‌کند و به هیچ VPS نیازی ندارد. حالت اختیاری **Full** می‌تواند ترافیک TCP/UDP شبکه‌ی LAN را با TPROXY به‌صورت شفاف عبور دهد، اما به یک `tunnel-node` جداگانه نیاز دارد.
 
-**This repository's user guide is for OpenWrt routers.** See the [Persian guide](README.fa.md), the [detailed English OpenWrt guide](openwrt/README.md), or [OpenWrt releases](https://github.com/dreamboxone/gvpn/releases).
+> **English:** this repository targets OpenWrt routers. See [`openwrt/README.md`](openwrt/README.md) for the English guide.
 
-## What you need
+## فهرست
 
-- An OpenWrt router with firewall4/nftables and a package format matching the release. APK packages are for APK-based OpenWrt; do not install them on older opkg/IPK firmware.
-- The package built for your router's architecture and firmware. Separate builds are provided for ARMv7 and AArch64. Kernel modules must match the exact firmware release and target.
-- A Google account for the standard Apps Script relay. This path needs no VPS. It relays HTTP/HTTPS through a manually configured proxy, not arbitrary TCP/UDP or the whole LAN.
+- [پیش‌نیازها](#پیشنیازها)
+- [۱. ساخت Google Apps Script و گرفتن Deployment ID و AUTH_KEY](#۱-ساخت-google-apps-script-و-گرفتن-deployment-id-و-auth_key)
+- [۲. نصب روی روتر](#۲-نصب-روی-روتر)
+- [۳. نصب گواهی CA روی دستگاه‌ها](#۳-نصب-گواهی-ca-روی-دستگاهها)
+- [شرح کامل گزینه‌های برنامه](#شرح-کامل-گزینههای-برنامه)
+- [دکمه‌های مدیریت سرویس](#دکمههای-مدیریت-سرویس)
+- [حذف و پاک‌سازی کامل](#حذف-و-پاکسازی-کامل)
+- [رفع اشکال](#رفع-اشکال)
 
-## 1. Create the Google Apps Script
+## پیش‌نیازها
 
-Access to [script.google.com](https://script.google.com/) may be filtered. If it does not open, connect through a VPN to create or manage the Web App.
+- روتر OpenWrt با `firewall4`/`nftables`.
+- پکیج متناسب با **معماری بسته‌های** روتر. نام فایل‌های ریلیز بر اساس معماری است، نه اسم برد. معماری روتر را با این دستور ببینید:
 
-1. Create a project at [script.google.com](https://script.google.com/) and replace its default `Code.gs` content with [`assets/apps_script/Code.gs`](assets/apps_script/Code.gs). This is the simplest VPS-free choice. An existing `CodeFull.gs` deployment also supports the web relay without a tunnel-node when GVPN is set to Apps Script mode.
-2. In the script, set a strong random value for `AUTH_KEY`. Keep it private; you will enter this same key in LuCI.
-3. Choose **Deploy → New deployment → Web app**. Set **Execute as** to **Me**, and set access as required by the script guide (the Web App must be reachable by the router). Approve Google's authorization prompt.
-4. Open **Deploy → Manage deployments** and copy the Deployment ID. Enter the ID only, not the full `/exec` URL.
-5. Every deployment you add must use the same `AUTH_KEY`. You can add several Deployment IDs in LuCI and remove them individually.
+  ```sh
+  apk --print-arch
+  ```
 
-Full mode is optional and requires both [`CodeFull.gs`](assets/apps_script/CodeFull.gs) and a separately deployed [`tunnel-node`](tunnel-node/README.md) on a VPS or Cloud Run. It is not part of the setup below.
+  | فایل ریلیز | معماری | نمونه دستگاه |
+  |---|---|---|
+  | `luci-app-gvpn-arm_cortex-a7_neon-vfpv4.apk` | `arm_cortex-a7_neon-vfpv4` | Google Wifi (ipq40xx) |
+  | `luci-app-gvpn-aarch64_cortex-a53.apk` | `aarch64_cortex-a53` | Linksys MX4200 (ipq807x)، mediatek/filogic |
+  | `luci-app-gvpn-aarch64_generic.apk` | `aarch64_generic` | armsr/armv8 و پردازنده‌های ARMv9 روی همان تارگت |
 
-## 2. Install on the router
+- فایل‌های `.apk` فقط برای OpenWrt مبتنی بر APK هستند (۲۵.x). برای فیرمورهای قدیمی‌تر با `opkg` از فایل‌های `.ipk` استفاده کنید.
+- یک حساب گوگل برای ساخت Apps Script.
 
-Download the `luci-app-gvpn-*.apk` package for the router's architecture from [Releases](https://github.com/dreamboxone/gvpn/releases). In LuCI, open **System → Software → Upload Package**, choose the APK, and install it. Alternatively, copy it to the router and run:
+## ۱. ساخت Google Apps Script و گرفتن Deployment ID و AUTH_KEY
+
+دسترسی به [script.google.com](https://script.google.com/) ممکن است فیلتر باشد. اگر باز نمی‌شود، برای ساخت یا مدیریت اسکریپت ابتدا با فیلترشکن وارد شوید.
+
+1. در [Google Apps Script](https://script.google.com/) یک پروژه بسازید و محتوای فایل پیش‌فرض `Code.gs` را با [`assets/apps_script/Code.gs`](assets/apps_script/Code.gs) جایگزین کنید. این ساده‌ترین انتخاب بدون VPS است. اگر از قبل `CodeFull.gs` منتشر کرده‌اید، بخش پراکسی وب آن هم در حالت Apps Script و بدون tunnel-node کار می‌کند.
+
+2. در کد، مقدار قوی و تصادفی برای `AUTH_KEY` بگذارید و آن را محرمانه نگه دارید؛ **همین مقدار را بعداً در LuCI وارد می‌کنید**. برای ساخت یک مقدار تصادفی:
+
+   ```sh
+   head -c 32 /dev/urandom | base64 | tr -d '=+/'
+   ```
+
+3. از منو **Deploy → New deployment → Web app** را بزنید. **Execute as** را روی **Me** و دسترسی را مطابق راهنمای اسکریپت تنظیم کنید تا روتر بتواند به Web App برسد. سپس درخواست مجوز گوگل را تأیید کنید.
+
+4. وارد **Deploy → Manage deployments** شوید و **Deployment ID** را کپی کنید. فقط خود شناسه را بردارید، نه آدرس کامل `/exec`. شناسه چیزی شبیه این است:
+
+   ```
+   AKfycbz...Q7uKotnm34Q
+   ```
+
+5. اگر چند Deployment می‌سازید، **همه باید از همان `AUTH_KEY` مشترک استفاده کنند.** در LuCI شناسه‌ها را جداگانه اضافه یا حذف می‌کنید و برنامه بار را بین آن‌ها پخش می‌کند تا سهمیه‌ی روزانه زودتر تمام نشود.
+
+## ۲. نصب روی روتر
+
+فایل متناسب با معماری روتر را از [Releases](https://github.com/dreamboxone/gvpn/releases) دانلود کنید. در LuCI به **System → Software → Upload Package** بروید و فایل را نصب کنید، یا آن را روی روتر کپی کرده و اجرا کنید:
 
 ```sh
 apk add --allow-untrusted /tmp/luci-app-gvpn-*.apk
 ```
 
-Open **Services → GVPN Manager**. The page displays the installed package version. If the router reports a missing `kmod-nft-tproxy`, use a package built for the exact firmware/SDK; do not install a kernel module from a different release or target.
+سپس **Services → GVPN Manager** را باز کنید. نسخه‌ی نصب‌شده بالای صفحه نمایش داده می‌شود.
 
-## 3. Configure the Apps Script proxy
+## ۳. نصب گواهی CA روی دستگاه‌ها
 
-1. Enter the shared `AUTH_KEY` and add one or more Deployment IDs.
-2. Select **Apps Script** and leave **Automatic LAN routing with TPROXY** off. This mode does not support transparent whole-LAN TCP/UDP routing.
-3. Click **Save & Apply** and start the service. Configure an HTTP proxy on the client using the router's LAN IP and port `8085`, or a SOCKS5 proxy on port `8086`, for supported web traffic.
+GVPN برای عبور دادن HTTPS آن را باز و دوباره امضا می‌کند، پس هر دستگاهی که از روتر عبور می‌کند باید گواهی CA روتر را معتبر بداند. **بدون این کار یوتیوب و بقیه‌ی سایت‌های HTTPS باز نمی‌شوند.**
 
-HTTPS through this proxy uses a locally generated certificate authority. The router's public CA certificate is `/etc/gvpn/data/mhrv-rs/ca/ca.crt`; install it as a trusted root only on client devices you control if you choose to use HTTPS through GVPN. Never copy or share the adjacent `ca.key` private key. Trusting this CA lets the router inspect HTTPS traffic; without it, clients should reject the proxy's certificates.
+در صفحه‌ی GVPN دکمه‌ی نارنجی **دریافت گواهی CA** را بزنید، یا مستقیم از این آدرس بگیرید:
 
-Do not enable GVPN TPROXY for the Apps Script-only path. It requires Full mode and a tunnel-node to handle arbitrary LAN TCP/UDP. A successful Apps Script deployment does not remove that limitation.
+```
+http://192.168.1.1/cgi-bin/gvpn-ca.crt
+```
 
-## Passwall2 and v2rayN
+- **ویندوز:** فایل را باز کنید → Install Certificate → Local Machine → «Place all certificates in the following store» → **Trusted Root Certification Authorities**.
+- **اندروید:** Settings → Security → Encryption & credentials → Install a certificate → **CA certificate**.
+- **iOS:** پس از نصب پروفایل، حتماً به Settings → General → About → **Certificate Trust Settings** بروید و اعتماد کامل را فعال کنید.
 
-- **Passwall2:** For this Apps Script setup, leave GVPN TPROXY off. You can add its local SOCKS5 endpoint at `127.0.0.1:8086` to Passwall2, but it does not provide arbitrary TCP/UDP tunneling. Full mode needs a tunnel-node.
-- **v2rayN on Windows:** For manual web proxy use, add the router's LAN IP as a SOCKS5 server on port `8086`.
+> گواهی فقط وقتی ساخته می‌شود که سرویس یک بار اجرا شده باشد. اگر لینک خطای ۴۰۴ داد، اول سرویس را **شروع** کنید.
 
-## Stop and uninstall
+**هشدار امنیتی:** اعتماد به این CA یعنی روتر می‌تواند محتوای HTTPS آن دستگاه را ببیند. فقط روی دستگاه‌هایی نصبش کنید که خودتان کنترل می‌کنید. فایل خصوصی `ca.key` را که کنار گواهی است هرگز کپی یا منتشر نکنید. بعضی برنامه‌ها (مثل اپ رسمی یوتیوب و اکثر اپ‌های بانکی) به دلیل certificate pinning حتی با نصب CA هم کار نمی‌کنند.
 
-First disable LAN TPROXY in LuCI and click **Save & Apply**, then run:
+## شرح کامل گزینه‌های برنامه
+
+همه‌ی گزینه‌ها در **Services → GVPN Manager** هستند و در `/etc/config/gvpn` ذخیره می‌شوند.
+
+### حالت اتصال (`mode`)
+
+پیش‌فرض: `apps_script`
+
+| مقدار | توضیح |
+|---|---|
+| **Apps Script** | ترافیک وب از رله‌ی Google Apps Script و تونل مستقیم لبه‌ی گوگل عبور می‌کند. بدون VPS کار می‌کند. هدایت LAN در این حالت فقط `TCP/80` و `TCP/443` را پوشش می‌دهد. |
+| **Full** | تونل کامل TCP/UDP. به `CodeFull.gs` و یک [`tunnel-node`](tunnel-node/README.md) روی VPS یا Cloud Run نیاز دارد. |
+| **اتصال مستقیم** | بدون رله. برای عیب‌یابی و مقایسه. |
+
+### Deployment IDهای گوگل (`script_ids`)
+
+فهرست شناسه‌هایی که در مرحله‌ی ۱ گرفتید. می‌توانید چند شناسه اضافه کنید تا سهمیه‌ی روزانه تقسیم شود. فقط حروف، عدد، `_` و `-` مجاز است.
+
+### کلید احراز هویت واسط (`auth_key`)
+
+همان `AUTH_KEY` داخل `Code.gs`. باید **دقیقاً** یکی باشد وگرنه رله همه‌ی درخواست‌ها را رد می‌کند.
+
+### نشانی شنود (`listen_host`)
+
+پیش‌فرض: `0.0.0.0`
+
+- `0.0.0.0` — پراکسی برای کل شبکه‌ی LAN در دسترس است.
+- `127.0.0.1` — فقط خود روتر. اگر می‌خواهید فقط از طریق هدایت خودکار LAN استفاده شود، این امن‌تر است.
+
+### پورت پراکسی HTTP (`listen_port`)
+
+پیش‌فرض: `8085`. برای تنظیم دستی پراکسی HTTP روی دستگاه‌ها.
+
+### پورت پراکسی SOCKS5 (`socks5_port`)
+
+پیش‌فرض: `8086`. برای تنظیم دستی SOCKS5، یا استفاده در Passwall2 و v2rayN. دو پورت نباید یکی باشند.
+
+### بررسی گواهی‌های TLS (`verify_ssl`)
+
+پیش‌فرض: روشن. خاموش کردن آن فقط برای عیب‌یابی است و امنیت را کم می‌کند.
+
+### هدایت خودکار ترافیک LAN با TPROXY (`lan_proxy_enabled`)
+
+پیش‌فرض: خاموش
+
+با روشن کردن آن، دستگاه‌های LAN بدون هیچ تنظیمی از GVPN عبور می‌کنند. رفتارش به حالت اتصال بستگی دارد:
+
+- **در Apps Script:** فقط `TCP/80` و `TCP/443` هدایت می‌شوند. `UDP/443` مسدود می‌شود تا مرورگر از QUIC به HTTPS معمولی برگردد.
+
+  همچنین برای دامنه‌هایی که DNS شبکه رکورد `A` آن‌ها را حذف می‌کند (مثل یوتیوب) یک آدرس IPv4 ثابت روی `dnsmasq` تنظیم و پاسخ‌های `AAAA` فیلتر می‌شوند. بدون این کار دستگاه فقط یک آدرس IPv6 غیرقابل‌مسیریابی می‌گیرد و چون روتر در این حالت مسیر IPv6 ندارد، سایت اصلاً باز نمی‌شود. با خاموش کردن این گزینه همه‌ی این تغییرات دقیقاً به حالت قبل برمی‌گردند.
+
+- **در Full:** کل TCP/UDP از تونل عبور می‌کند و DNSهای DHCP شبکه‌ی انتخابی موقتاً به DNS عمومی گوگل تغییر می‌کنند.
+
+> اگر **Passwall2** فعال باشد این گزینه کار نمی‌کند و خطا می‌دهد؛ اول Passwall2 را خاموش کنید. ترافیک خود روتر و ICMP از این مسیر عبور نمی‌کنند.
+
+### اجرای خودکار هنگام روشن‌شدن روتر (`autostart`)
+
+پیش‌فرض: خاموش. با تیک‌زدن و ذخیره، سرویس بعد از هر راه‌اندازی روتر خودکار اجرا می‌شود.
+
+### رابط‌های LAN برای هدایت (`lan_devices`)
+
+پیش‌فرض: `br-lan`. فقط وقتی معنا دارد که هدایت خودکار LAN روشن باشد.
+
+### سطح گزارش (`log_level`)
+
+پیش‌فرض: `info`. مقادیر ممکن: `error`، `warn`، `info`، `debug`، `trace`. گزارش‌ها را با `logread -e gvpn` ببینید.
+
+## دکمه‌های مدیریت سرویس
+
+| دکمه | کار |
+|---|---|
+| **شروع** | اجرای سرویس |
+| **توقف** | توقف سرویس و برداشتن قوانین TPROXY و تغییرات DNS |
+| **راه‌اندازی مجدد** | اعمال تنظیمات جدید |
+| **دریافت گواهی CA** | دانلود گواهی عمومی برای نصب روی دستگاه‌ها |
+
+## حذف و پاک‌سازی کامل
+
+**اول** در LuCI گزینه‌ی هدایت خودکار LAN را خاموش کنید و **Save & Apply** بزنید تا قوانین فایروال و تنظیمات DNS درست برگردند. بعد:
 
 ```sh
 /etc/init.d/gvpn stop
@@ -57,14 +169,40 @@ First disable LAN TPROXY in LuCI and click **Save & Apply**, then run:
 apk del luci-app-gvpn
 ```
 
-OpenWrt may preserve `/etc/config/gvpn` as a configuration file after uninstall. Remove it separately only if you also want to delete the saved credentials and settings.
-
-## Build for another target
-
-Use the official OpenWrt SDK matching the router's firmware target and release. In WSL/Linux, run:
+OpenWrt فایل `/etc/config/gvpn` را به‌عنوان فایل پیکربندی نگه می‌دارد. برای پاک کردن کامل تنظیمات و کلیدهای ذخیره‌شده:
 
 ```sh
-./scripts/build-openwrt.sh /path/to/openwrt-sdk
+rm -f /etc/config/gvpn
+rm -rf /etc/gvpn
 ```
 
-The script builds the Rust binary and LuCI APK for that SDK's package architecture. See [`openwrt/README.md`](openwrt/README.md) for target details, limitations, troubleshooting, and package testing.
+`/etc/gvpn` شامل گواهی CA، کلید خصوصی و وضعیت سهمیه است. با پاک کردن آن، دفعه‌ی بعد یک CA تازه ساخته می‌شود و باید دوباره روی همه‌ی دستگاه‌ها نصبش کنید.
+
+اگر سرویس را بدون خاموش‌کردن هدایت LAN حذف کردید، این دستورها قوانین باقی‌مانده را پاک می‌کنند:
+
+```sh
+rm -f /usr/share/nftables.d/table-pre/90-gvpn.nft
+fw4 reload
+```
+
+## رفع اشکال
+
+**یوتیوب یا یک سایت خاص باز نمی‌شود، ولی بقیه کار می‌کنند.** معمولاً DNS است. روی روتر بررسی کنید:
+
+```sh
+nslookup -type=A www.youtube.com 127.0.0.1
+```
+
+اگر هیچ رکورد `A` برنگشت، DNS شبکه‌ی شما آن را حذف کرده است. هدایت خودکار LAN را روشن کنید تا GVPN خودش این را جبران کند. روی اندروید هم `Settings → Network & internet → Private DNS` را روی **Off** یا **Automatic** بگذارید، وگرنه گوشی DNS روتر را دور می‌زند.
+
+**خطای گواهی در مرورگر.** گواهی CA روی آن دستگاه نصب یا معتبر نشده است. به [بخش ۳](#۳-نصب-گواهی-ca-روی-دستگاهها) برگردید.
+
+**یک اپ خاص کار نمی‌کند ولی مرورگر درست است.** آن اپ certificate pinning دارد و با بازکردن HTTPS سازگار نیست. راهی برای رفعش از سمت روتر وجود ندارد.
+
+**سرویس بالا نمی‌آید.** گزارش را ببینید:
+
+```sh
+logread -e gvpn | tail -50
+```
+
+**خطای `kmod-nft-tproxy` موقع نصب.** پکیج را متناسب با همان نسخه و تارگت فیرمور روتر بردارید؛ ماژول کرنل از ریلیز دیگری نصب نکنید.

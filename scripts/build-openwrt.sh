@@ -20,7 +20,13 @@ fail() {
 }
 
 [[ -f "${SDK_ROOT}/.config" ]] || fail "OpenWrt SDK config not found at ${SDK_ROOT}"
-grep -Fqx 'CONFIG_USE_APK=y' "${SDK_ROOT}/.config" || fail "This build script expects an APK-based OpenWrt SDK"
+# OpenWrt 25.x SDKs build APK; 24.10 and older build IPK. Follow whichever
+# the SDK is configured for instead of insisting on one.
+if grep -Fqx 'CONFIG_USE_APK=y' "${SDK_ROOT}/.config"; then
+	PKG_EXT="apk"
+else
+	PKG_EXT="ipk"
+fi
 
 EXPECTED_ARCH="$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\([^"]*\)"$/\1/p' "${SDK_ROOT}/.config")"
 TARGET_BOARD="$(sed -n 's/^CONFIG_TARGET_BOARD="\([^"]*\)"$/\1/p' "${SDK_ROOT}/.config")"
@@ -74,19 +80,28 @@ trap cleanup EXIT
 make -C "${SDK_ROOT}" CONFIG_PACKAGE_luci-app-gvpn=y package/luci-app-gvpn/compile
 
 mapfile -t BUILT_PACKAGES < <(find "${SDK_ROOT}/bin/packages/${EXPECTED_ARCH}" -type f \
-	-name 'luci-app-gvpn-*.apk' -print)
-[[ "${#BUILT_PACKAGES[@]}" -eq 1 ]] || fail "Expected exactly one luci-app-gvpn APK, found ${#BUILT_PACKAGES[@]}"
+	-name "luci-app-gvpn-*.${PKG_EXT}" -print)
+[[ "${#BUILT_PACKAGES[@]}" -eq 1 ]] || fail "Expected exactly one luci-app-gvpn ${PKG_EXT^^}, found ${#BUILT_PACKAGES[@]}"
 
-rm -f "${DIST_DIR}"/gvpn-*.apk "${DIST_DIR}"/luci-app-gvpn-*.apk
+rm -f "${DIST_DIR}"/gvpn-*."${PKG_EXT}" "${DIST_DIR}"/luci-app-gvpn-*."${PKG_EXT}"
 cp "${BUILT_PACKAGES[@]}" "${DIST_DIR}/"
 
-for package in "${DIST_DIR}"/*.apk; do
+for package in "${DIST_DIR}"/*."${PKG_EXT}"; do
 	case "$(basename "${package}")" in
-		luci-app-gvpn-*.apk) package_dir="${CHECK_DIR}/luci-app-gvpn" ;;
-		*) fail "Unexpected APK in output directory: ${package}" ;;
+		luci-app-gvpn-*) package_dir="${CHECK_DIR}/luci-app-gvpn" ;;
+		*) fail "Unexpected package in output directory: ${package}" ;;
 	esac
 	mkdir -p "${package_dir}"
-	"${SDK_ROOT}/staging_dir/host/bin/apk" extract --allow-untrusted --destination "${package_dir}" "${package}"
+	if [[ "${PKG_EXT}" == apk ]]; then
+		"${SDK_ROOT}/staging_dir/host/bin/apk" extract --allow-untrusted --destination "${package_dir}" "${package}"
+	else
+		# An IPK is an ar/tar wrapper; the payload we inspect is data.tar.*.
+		tar -xzf "${package}" -C "${package_dir}" ./data.tar.gz 2>/dev/null \
+			|| tar -xf "${package}" -C "${package_dir}"
+		data_tar="$(find "${package_dir}" -maxdepth 1 -name 'data.tar*' -print -quit)"
+		[[ -n "${data_tar}" ]] || fail "${package} has no data payload"
+		tar -xf "${data_tar}" -C "${package_dir}"
+	fi
 	[[ -x "${package_dir}/usr/bin/gvpn" ]] || fail "${package} is missing usr/bin/gvpn"
 	[[ -f "${package_dir}/etc/init.d/gvpn" ]] || fail "${package} is missing the GVPN service"
 	[[ -f "${package_dir}/etc/config/gvpn" ]] || fail "${package} is missing its UCI config"
@@ -94,5 +109,5 @@ for package in "${DIST_DIR}"/*.apk; do
 done
 
 file "${PREBUILT_DIR}/gvpn"
-sha256sum "${PREBUILT_DIR}/gvpn" "${DIST_DIR}"/*.apk
+sha256sum "${PREBUILT_DIR}/gvpn" "${DIST_DIR}"/*."${PKG_EXT}"
 echo "OpenWrt packages built and inspected for ${TARGET_BOARD}/${TARGET_SUBTARGET} (${EXPECTED_ARCH}, ${TARGET_TRIPLE})."
