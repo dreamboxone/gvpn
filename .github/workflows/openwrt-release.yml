@@ -1,0 +1,109 @@
+name: OpenWrt GVPN release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'openwrt-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: ipq40xx/chromium
+            sdk: openwrt-sdk-25.12.5-ipq40xx-chromium_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst
+            sha256: 09fec3a23a8cac4156bc976550a71542abdf0abf7e9aba0a6e869b9c0184e637
+            arch: arm_cortex-a7_neon-vfpv4
+            rust_target: armv7-unknown-linux-musleabihf
+            label: armv7-ipq40xx-chromium
+          - target: mediatek/filogic
+            sdk: openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+            sha256: ff4a38a397caa2cfe1c39e18f84ddede14878221b3593c3f2c4cfe24e3ec4c25
+            arch: aarch64_cortex-a53
+            rust_target: aarch64-unknown-linux-musl
+            label: armv8-mediatek-filogic
+          - target: armsr/armv8
+            sdk: openwrt-sdk-25.12.5-armsr-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+            sha256: 1b0316604a3e820b2b008a1baff3f9dac6716af942bef800930e58c7de98c98b
+            arch: aarch64_generic
+            rust_target: aarch64-unknown-linux-musl
+            label: armv8-armv9-armsr-generic
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libssl-dev pkg-config zstd curl git python3
+          rustup target add '${{ matrix.rust_target }}'
+      - name: Download matching OpenWrt SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://downloads.openwrt.org/releases/25.12.5/targets/${{ matrix.target }}/${{ matrix.sdk }}"
+          curl --fail --location --retry 5 --retry-all-errors --output sdk.tar.zst "$url"
+          printf '%s  %s\n' '${{ matrix.sha256 }}' sdk.tar.zst | sha256sum --check
+          mkdir sdk
+          tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+          grep -Fqx 'CONFIG_USE_APK=y' sdk/.config
+          grep -Fqx 'CONFIG_TARGET_ARCH_PACKAGES="${{ matrix.arch }}"' sdk/.config
+      - name: Prepare SDK feeds
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sdk
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+      - name: Build and inspect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/build-openwrt.sh "$GITHUB_WORKSPACE/sdk"
+          ./scripts/test-openwrt-package.sh "$GITHUB_WORKSPACE/sdk"
+          package=(dist/openwrt/${{ matrix.arch }}/luci-app-gvpn-*.apk)
+          test "${#package[@]}" -eq 1
+          mkdir -p release
+          cp "${package[0]}" "release/luci-app-gvpn-${{ matrix.label }}.apk"
+          sha256sum release/*.apk > release/SHA256SUMS-${{ matrix.label }}.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-${{ matrix.label }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: openwrt-*
+          path: release
+          merge-multiple: true
+      - name: Publish all three targets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^PKG_VERSION:=//p' openwrt/package/luci-app-gvpn/Makefile)
+          revision=$(sed -n 's/^PKG_RELEASE:=//p' openwrt/package/luci-app-gvpn/Makefile)
+          tag="openwrt-v${version}-r${revision}"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match package $tag" >&2
+            exit 1
+          fi
+          test "$(find release -maxdepth 1 -name '*.apk' | wc -l)" -eq 3
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release/* --clobber
+          else
+            gh release create "$tag" release/* --target "$GITHUB_SHA" \
+              --title "GVPN for OpenWrt ${version}-r${revision}" \
+              --notes 'OpenWrt 25.12.5 APKs: ARMv7 ipq40xx/chromium, ARMv8 mediatek/filogic, and generic AArch64 armsr/armv8 (also compatible with ARMv9 CPUs running that target). Install only on matching firmware and package architecture.'
+          fi
