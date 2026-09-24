@@ -50,8 +50,6 @@ jobs:
           printf '%s  %s\n' '${{ matrix.sha256 }}' sdk.tar.zst | sha256sum --check
           mkdir sdk
           tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
-          grep -Fqx 'CONFIG_USE_APK=y' sdk/.config
-          grep -Fqx 'CONFIG_TARGET_ARCH_PACKAGES="${{ matrix.arch }}"' sdk/.config
       - name: Prepare SDK feeds
         shell: bash
         run: |
@@ -59,6 +57,9 @@ jobs:
           cd sdk
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          make defconfig
+          grep -Fqx 'CONFIG_USE_APK=y' .config
+          grep -Fqx 'CONFIG_TARGET_ARCH_PACKAGES="${{ matrix.arch }}"' .config
       - name: Build and inspect APK
         shell: bash
         run: |
