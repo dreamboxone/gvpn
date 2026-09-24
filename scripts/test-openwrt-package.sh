@@ -8,8 +8,8 @@ ARCH="$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\([^"]*\)"$/\1/p' "${SDK_ROOT}/.
 [[ -n "${ARCH}" ]] || { echo "Unable to read package architecture from SDK" >&2; exit 1; }
 DIST_DIR="${REPO_ROOT}/dist/openwrt/${ARCH}"
 APK="${SDK_ROOT}/staging_dir/host/bin/apk"
-PKG_VERSION="$(sed -n 's/^PKG_VERSION:=\(.*\)$/\1/p' "${REPO_ROOT}/openwrt/package/luci-app-gvpn/Makefile")"
-PKG_RELEASE="$(sed -n 's/^PKG_RELEASE:=\(.*\)$/\1/p' "${REPO_ROOT}/openwrt/package/luci-app-gvpn/Makefile")"
+PKG_VERSION="$(sed -n 's/^PKG_VERSION:=\(.*\)$/\1/p' "${REPO_ROOT}/openwrt/package/luci-app-gvpn/Makefile" | tr -d '\r')"
+PKG_RELEASE="$(sed -n 's/^PKG_RELEASE:=\(.*\)$/\1/p' "${REPO_ROOT}/openwrt/package/luci-app-gvpn/Makefile" | tr -d '\r')"
 CHECK_DIR="$(mktemp -d)"
 trap 'rm -rf "${CHECK_DIR}"' EXIT
 
