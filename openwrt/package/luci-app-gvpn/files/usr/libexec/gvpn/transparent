@@ -12,6 +12,15 @@ SINGBOX_CONFIG=/var/run/gvpn/sing-box.json
 DNS_STATE=/etc/gvpn/tproxy-dns.state
 DNS4=8.8.8.8
 DNS6=2001:4860:4860::8888
+DNS_PIN_STATE=/etc/gvpn/dns-pin.state
+DNS_PIN_ADDR=216.239.38.120
+# Names a filtered resolver answers with no A record and an unroutable
+# AAAA. A client that only learns the AAAA never reaches TPROXY, so the
+# traffic dies before GVPN sees it. Routing here is driven by the TLS
+# SNI rather than the address the client dialled, so pinning any
+# routable IPv4 is enough to pull the connection in and let the MITM
+# send it down the right path.
+DNS_PIN_DOMAINS='youtube.com youtu.be ytimg.com youtube-nocookie.com googlevideo.com ggpht.com youtubei.googleapis.com'
 
 dns_restore() {
 	[ -f "$DNS_STATE" ] || return 0
@@ -84,6 +93,50 @@ EOF
 	/etc/init.d/odhcpd reload >/dev/null 2>&1 || true
 }
 
+dns_pin_restore() {
+	local kind value restart
+	[ -f "$DNS_PIN_STATE" ] || return 0
+	restart=0
+	while IFS="$(printf '\t')" read -r kind value; do
+		case "$kind" in
+			addr) uci -q del_list "dhcp.@dnsmasq[0].address=${value}" || true; restart=1 ;;
+			aaaa-old) uci -q set "dhcp.@dnsmasq[0].filter_aaaa=${value}" || true; restart=1 ;;
+			aaaa-added) uci -q delete dhcp.@dnsmasq[0].filter_aaaa || true; restart=1 ;;
+		esac
+	done < "$DNS_PIN_STATE"
+	rm -f "$DNS_PIN_STATE"
+	[ "$restart" = 1 ] || return 0
+	uci commit dhcp
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+}
+
+dns_pin_apply() {
+	local state_tmp domain entry old
+	mkdir -p /etc/gvpn
+	state_tmp=${DNS_PIN_STATE}.tmp
+	: > "$state_tmp"
+	chmod 0600 "$state_tmp"
+	mv "$state_tmp" "$DNS_PIN_STATE"
+	for domain in $DNS_PIN_DOMAINS; do
+		entry="/${domain}/${DNS_PIN_ADDR}"
+		uci -q del_list "dhcp.@dnsmasq[0].address=${entry}" || true
+		uci add_list "dhcp.@dnsmasq[0].address=${entry}" || return 1
+		printf 'addr\t%s\n' "$entry" >> "$DNS_PIN_STATE"
+	done
+	# Apps Script mode relays web traffic over IPv4 only. Leaving AAAA
+	# answers in place lets a dual-stack client prefer an IPv6 route the
+	# router cannot carry, which looks exactly like the site being down.
+	old=$(uci -q get dhcp.@dnsmasq[0].filter_aaaa || true)
+	if [ -n "$old" ]; then
+		printf 'aaaa-old\t%s\n' "$old" >> "$DNS_PIN_STATE"
+	else
+		printf 'aaaa-added\t\n' >> "$DNS_PIN_STATE"
+	fi
+	uci set dhcp.@dnsmasq[0].filter_aaaa='1' || return 1
+	uci commit dhcp
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+}
+
 remove_rules() {
 	rm -f "$TABLE_RULE"
 	while ip rule del fwmark "$RULE_MARK/$RULE_MASK" lookup "$TABLE" 2>/dev/null; do :; done
@@ -91,6 +144,7 @@ remove_rules() {
 	ip route del local 0.0.0.0/0 dev lo table "$TABLE" 2>/dev/null || true
 	ip -6 route del local ::/0 dev lo table "$TABLE" 2>/dev/null || true
 	dns_restore
+	dns_pin_restore
 }
 
 case "$ACTION" in
@@ -106,7 +160,14 @@ esac
 enabled=$(uci -q get gvpn.main.lan_proxy_enabled || echo 0)
 [ "$enabled" = 1 ] || { remove_rules; fw4 reload >/dev/null 2>&1 || true; exit 0; }
 mode=$(uci -q get gvpn.main.mode || echo apps_script)
-[ "$mode" = full ] || { echo "LAN transparent routing requires Full mode and CodeFull.gs" >&2; exit 1; }
+case "$mode" in
+	apps_script|full) ;;
+	*) echo "LAN transparent routing requires Apps Script or Full mode" >&2; exit 1 ;;
+esac
+if ps w | grep -q '[t]mp/etc/passwall2/bin/'; then
+	echo "Passwall2 transparent rules are active; disable Passwall2 before enabling GVPN LAN routing" >&2
+	exit 1
+fi
 socks5_port=$(uci -q get gvpn.main.socks5_port || echo 8086)
 
 mkdir -p "$(dirname "$TABLE_RULE")" /var/run/gvpn
@@ -115,18 +176,25 @@ devices=$(uci -q export gvpn | awk -F "'" '/^[[:space:]]*list lan_devices / { pr
 
 tmp=${TABLE_RULE}.tmp
 {
-	printf 'chain gvpn_tproxy {\n\ttype filter hook prerouting priority mangle; policy accept;\n\tmeta mark %s/%s return\n' "$RULE_MARK" "$RULE_MASK"
+	printf 'chain gvpn_tproxy {\n\ttype filter hook prerouting priority mangle; policy accept;\n\tmeta mark & %s == %s return\n' "$RULE_MASK" "$RULE_MARK"
 	for device in $devices; do
 		case "$device" in *[!A-Za-z0-9_.:-]*) echo "invalid LAN device name: $device" >&2; exit 1 ;; esac
 		printf '\tiifname "%s" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 } return\n' "$device"
 		printf '\tiifname "%s" ip6 daddr { ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001:db8::/32, fc00::/7, fe80::/10, ff00::/8 } return\n' "$device"
-		printf '\tiifname "%s" meta l4proto { tcp, udp } tproxy to :1536 meta mark set %s accept\n' "$device" "$RULE_MARK"
+		if [ "$mode" = apps_script ]; then
+			# Apps Script can fetch web requests, not arbitrary TCP or UDP.
+			# Prevent QUIC from bypassing the HTTPS relay; browsers can retry over TCP.
+			printf '\tiifname "%s" udp dport 443 drop\n' "$device"
+			printf '\tiifname "%s" tcp dport { 80, 443 } tproxy to :1536 meta mark set %s accept\n' "$device" "$RULE_MARK"
+		else
+			printf '\tiifname "%s" meta l4proto { tcp, udp } tproxy to :1536 meta mark set %s accept\n' "$device" "$RULE_MARK"
+		fi
 	done
 	printf '}\n'
 } > "$tmp"
 chmod 0644 "$tmp"
 mv "$tmp" "$TABLE_RULE"
-if ! fw4 check >/dev/null 2>&1; then
+if ! fw4 check >/dev/null; then
 	remove_rules
 	echo "fw4 rejected GVPN transparent rules; rules were rolled back" >&2
 	exit 1
@@ -150,16 +218,17 @@ cat > "$SINGBOX_CONFIG" <<'JSON'
 			"type": "tproxy",
 			"tag": "gvpn-lan",
 			"listen": "::",
-			"listen_port": 1536,
-			"sniff": true,
-			"sniff_override_destination": true
+			"listen_port": 1536
 		}
 	],
 	"outbounds": [
 		{ "type": "socks", "tag": "gvpn-socks", "server": "127.0.0.1", "server_port": 8086, "version": "5" }
 	],
 	"route": {
-		"rules": [ { "inbound": [ "gvpn-lan" ], "outbound": "gvpn-socks" } ],
+		"rules": [
+			{ "inbound": [ "gvpn-lan" ], "action": "sniff" },
+			{ "inbound": [ "gvpn-lan" ], "action": "route", "outbound": "gvpn-socks" }
+		],
 		"final": "gvpn-socks"
 	}
 }
@@ -167,7 +236,7 @@ JSON
 sed "s/\"server_port\": 8086/\"server_port\": ${socks5_port}/" "$SINGBOX_CONFIG" > "${SINGBOX_CONFIG}.tmp"
 mv "${SINGBOX_CONFIG}.tmp" "$SINGBOX_CONFIG"
 
-if ! sing-box check -c "$SINGBOX_CONFIG" >/dev/null 2>&1; then
+if ! sing-box check -c "$SINGBOX_CONFIG" >/dev/null; then
 	remove_rules
 	fw4 reload >/dev/null 2>&1 || true
 	echo "sing-box rejected the generated configuration; rules were rolled back" >&2
@@ -175,9 +244,17 @@ if ! sing-box check -c "$SINGBOX_CONFIG" >/dev/null 2>&1; then
 fi
 
 dns_restore
-if ! dns_apply; then
+dns_pin_restore
+if [ "$mode" = full ]; then
+	if ! dns_apply; then
+		remove_rules
+		fw4 reload >/dev/null 2>&1 || true
+		echo "could not configure LAN DNS for transparent routing; rules were rolled back" >&2
+		exit 1
+	fi
+elif ! dns_pin_apply; then
 	remove_rules
 	fw4 reload >/dev/null 2>&1 || true
-	echo "could not configure LAN DNS for transparent routing; rules were rolled back" >&2
+	echo "could not pin LAN DNS for the Apps Script relay; rules were rolled back" >&2
 	exit 1
 fi

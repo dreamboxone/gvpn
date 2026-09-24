@@ -1,0 +1,14 @@
+#!/bin/sh
+
+CA_CERT=/etc/gvpn/data/mhrv-rs/ca/ca.crt
+
+if [ ! -r "$CA_CERT" ]; then
+	printf 'Status: 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n'
+	printf 'Start GVPN first so its public CA certificate can be generated.\n'
+	exit 0
+fi
+
+printf 'Content-Type: application/x-x509-ca-cert\r\n'
+printf 'Content-Disposition: attachment; filename="gvpn-ca.crt"\r\n'
+printf 'Cache-Control: no-store\r\n\r\n'
+cat "$CA_CERT"

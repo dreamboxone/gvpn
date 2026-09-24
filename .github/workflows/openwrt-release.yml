@@ -21,19 +21,19 @@ jobs:
             sha256: 09fec3a23a8cac4156bc976550a71542abdf0abf7e9aba0a6e869b9c0184e637
             arch: arm_cortex-a7_neon-vfpv4
             rust_target: armv7-unknown-linux-musleabihf
-            label: armv7-ipq40xx-chromium
+            label: arm_cortex-a7_neon-vfpv4
           - target: mediatek/filogic
             sdk: openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
             sha256: ff4a38a397caa2cfe1c39e18f84ddede14878221b3593c3f2c4cfe24e3ec4c25
             arch: aarch64_cortex-a53
             rust_target: aarch64-unknown-linux-musl
-            label: armv8-mediatek-filogic
+            label: aarch64_cortex-a53
           - target: armsr/armv8
             sdk: openwrt-sdk-25.12.5-armsr-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
             sha256: 1b0316604a3e820b2b008a1baff3f9dac6716af942bef800930e58c7de98c98b
             arch: aarch64_generic
             rust_target: aarch64-unknown-linux-musl
-            label: armv8-armv9-armsr-generic
+            label: aarch64_generic
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
@@ -104,7 +104,15 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" release/* --clobber
           else
+            notes=$(printf '%s\n' \
+              'OpenWrt 25.12.5 APKs, named after the package architecture they target. Match the name against `apk --print-arch` on the router, not against the board name.' \
+              '' \
+              '- `arm_cortex-a7_neon-vfpv4` — ARMv7, e.g. ipq40xx (Google Wifi).' \
+              '- `aarch64_cortex-a53` — ARMv8 Cortex-A53, e.g. mediatek/filogic and qualcommax/ipq807x (Linksys MX4200).' \
+              '- `aarch64_generic` — generic AArch64, e.g. armsr/armv8; also runs on ARMv9 CPUs on that target.' \
+              '' \
+              'Install only on firmware whose package architecture matches.')
             gh release create "$tag" release/* --target "$GITHUB_SHA" \
               --title "GVPN for OpenWrt ${version}-r${revision}" \
-              --notes 'OpenWrt 25.12.5 APKs: ARMv7 ipq40xx/chromium, ARMv8 mediatek/filogic, and generic AArch64 armsr/armv8 (also compatible with ARMv9 CPUs running that target). Install only on matching firmware and package architecture.'
+              --notes "$notes"
           fi

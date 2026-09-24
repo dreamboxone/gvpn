@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-gvpn
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=7
+PKG_RELEASE:=11
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=dreamboxone
 
@@ -60,6 +60,8 @@ define Package/luci-app-gvpn/install
 	chmod 0644 $(1)/usr/share/luci/menu.d/luci-app-gvpn.json
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./root/usr/share/rpcd/acl.d/luci-app-gvpn.json $(1)/usr/share/rpcd/acl.d/luci-app-gvpn.json
+	$(INSTALL_DIR) $(1)/www/cgi-bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/www/cgi-bin/gvpn-ca.crt $(1)/www/cgi-bin/gvpn-ca.crt
 endef
 
 define Package/luci-app-gvpn/conffiles

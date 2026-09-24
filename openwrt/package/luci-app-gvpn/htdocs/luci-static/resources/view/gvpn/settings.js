@@ -6,6 +6,15 @@
 'require poll';
 'require uci';
 
+// The Makefile stamps the package version in as "<version>-r<release>".
+// Spell that out in Persian rather than showing the raw build tag.
+function versionLabel(raw) {
+	var parts = /^(.+)-r(\d+)$/.exec(raw);
+	if (!parts)
+		return _('نسخه') + ' ' + raw;
+	return _('نسخه') + ' ' + parts[1] + ' -' + _('ویرایش') + ' ' + parts[2];
+}
+
 return view.extend({
 	load: function() {
 		return uci.load('gvpn').then(function() {
@@ -16,20 +25,21 @@ return view.extend({
 				uci.unset('gvpn', 'main', 'script_id');
 			}
 			return fs.exec('/usr/libexec/gvpn/status').then(function(res) {
-			return JSON.parse(res.stdout);
-		}).catch(function() {
-			return { running: false, autostart: false, transparent: false };
-		});
+				var status = JSON.parse(res.stdout);
+				uci.set('gvpn', 'main', 'autostart', status.autostart ? '1' : '0');
+				return status;
+			}).catch(function() {
+				return { running: false, autostart: false, transparent: false };
+			});
 		});
 	},
 
 	handleSaveApply: function(ev, mode) {
 		return this.handleSave(ev).then(function() {
-			if (uci.get('gvpn', 'main', 'lan_proxy_enabled') === '1')
-				return fs.exec('/etc/init.d/gvpn', [ 'enable' ]);
-			return Promise.resolve();
-		}).then(function() {
 			return uci.apply();
+		}).then(function() {
+			var action = uci.get('gvpn', 'main', 'autostart') === '1' ? 'enable' : 'disable';
+			return fs.exec('/etc/init.d/gvpn', [ action ]);
 		}).then(L.bind(function() {
 			return this._service('restart', _('تنظیمات اعمال شد و سرویس دوباره راه‌اندازی شد.'));
 		}, this));
@@ -118,11 +128,11 @@ return view.extend({
 		s.anonymous = true;
 
 		var mode = s.option(form.ListValue, 'mode', _('حالت اتصال'));
-		mode.value('apps_script', _('Apps Script — فقط پراکسی وب'));
+		mode.value('apps_script', _('Apps Script — پراکسی وب و هدایت آزمایشی LAN'));
 		mode.value('full', _('Full — تونل کامل TCP/UDP و هدایت LAN'));
 		mode.value('direct', _('اتصال مستقیم'));
 		mode.default = 'apps_script';
-		mode.description = _('برای راه‌اندازی بدون VPS، فایل Code.gs را در Google Apps Script منتشر و حالت Apps Script را انتخاب کنید. این حالت برای پراکسی دستی وب است. Full و هدایت خودکار LAN به CodeFull.gs و tunnel-node روی VPS یا Cloud Run نیاز دارند.');
+		mode.description = _('Apps Script با Code.gs بدون VPS کار می‌کند. هدایت خودکار LAN در این حالت فقط برای وب TCP/80 و TCP/443 است و روی دستگاه‌های کاربر به نصب CA نیاز دارد. Full برای TCP/UDP به CodeFull.gs و tunnel-node نیاز دارد.');
 
 		var scripts = s.option(form.DynamicList, 'script_ids', _('Deployment IDهای گوگل'));
 		scripts.rmempty = true;
@@ -154,7 +164,11 @@ return view.extend({
 
 		var lanProxy = s.option(form.Flag, 'lan_proxy_enabled', _('هدایت خودکار ترافیک LAN با TPROXY'));
 		lanProxy.default = '0';
-		lanProxy.description = _('با فعال‌کردن این گزینه، OpenWrt ترافیک TCP و UDP عبوری شبکه LAN را بدون نیاز به تنظیم دستگاه‌ها به GVPN Full می‌فرستد. برای جلوگیری از نشت DNS، DNSهای DHCPv4/v6 شبکه‌های انتخابی موقتا به DNS عمومی گوگل تغییر می‌کنند و با خاموش‌کردن گزینه به مقدار قبلی برمی‌گردند. در این حالت ممکن است نام دستگاه‌های محلی باز نشود. ترافیک ICMP و ترافیک خود روتر از این مسیر عبور نمی‌کند. اجرای خودکار سرویس هم فعال می‌شود.');
+		lanProxy.description = _('در Apps Script فقط وب روی TCP/80 و TCP/443 هدایت می‌شود و UDP/443 برای بازگشت مرورگر از QUIC به HTTPS معمولی مسدود می‌شود. برای دامنه‌هایی که DNS شبکه رکورد A آن‌ها را حذف می‌کند (مانند یوتیوب) یک آدرس IPv4 ثابت روی dnsmasq تنظیم و پاسخ‌های AAAA فیلتر می‌شوند تا ترافیک وارد TPROXY شود؛ با خاموش‌کردن این گزینه همه به حالت قبل برمی‌گردد. HTTPS روی دستگاه کاربر به اعتماد به CA روتر نیاز دارد و همهٔ برنامه‌ها سازگار نیستند. در Full، TCP/UDP از تونل عبور می‌کند و DNSهای DHCP شبکهٔ انتخابی موقتاً تغییر می‌کنند.');
+
+		var autostart = s.option(form.Flag, 'autostart', _('اجرای خودکار هنگام روشن‌شدن روتر'));
+		autostart.default = '0';
+		autostart.description = _('با تیک‌زدن و ذخیرهٔ تنظیمات، سرویس پس از هر راه‌اندازی روتر خودکار اجرا می‌شود. بدون تیک، شروع سرویس فقط دستی است.');
 
 		var lanDevices = s.option(form.DynamicList, 'lan_devices', _('رابط‌های LAN برای هدایت'));
 		lanDevices.default = [ 'br-lan' ];
@@ -173,16 +187,20 @@ return view.extend({
 		this._service = service;
 
 		var panel = E('div', { 'class': 'gvpn-dashboard' }, [
-			E('style', {}, '.gvpn-dashboard{--gvpn-muted:#8191a8;max-width:1120px;margin:18px auto 24px}.gvpn-hero{position:relative;overflow:hidden;padding:20px 28px;border-radius:18px;background:linear-gradient(120deg,#102947,#155c9d 62%,#3186e5);color:#fff;box-shadow:0 14px 34px rgba(22,71,122,.22)}.gvpn-hero:after{content:"";position:absolute;width:210px;height:210px;border:1px solid rgba(255,255,255,.18);border-radius:50%;right:8%;top:-118px;box-shadow:0 0 0 28px rgba(255,255,255,.05),0 0 0 58px rgba(255,255,255,.035)}.gvpn-hero h2{position:relative;z-index:1;margin:0;color:#fff;font-size:26px}.gvpn-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:16px 0}.gvpn-card{padding:18px 20px;border:1px solid rgba(91,119,158,.2);border-radius:14px;background:var(--background-color-high,#fff);box-shadow:0 5px 18px rgba(22,42,76,.08)}.gvpn-card h3{margin:0 0 12px;font-size:15px}.gvpn-stat{display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--gvpn-muted)}.gvpn-card code{direction:ltr;display:inline-block;max-width:100%;overflow-wrap:anywhere}.gvpn-dashboard .label{padding:5px 11px;border-radius:9px;font-weight:700}.gvpn-state-on{background:#15803d!important;color:#fff!important;border:1px solid #15803d}.gvpn-state-off{background:#c62828!important;color:#fff!important;border:1px solid #c62828}.gvpn-note{margin:18px 0 12px;padding:12px 16px;border:1px solid #b8d6fa;border-radius:12px;background:#edf5ff;color:#24466d;line-height:1.9}.gvpn-feedback{margin-top:10px}.gvpn-button-row{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0 20px}.gvpn-button-row .cbi-button{margin:0!important;padding:8px 18px;border:1px solid transparent;border-radius:10px;font-weight:700;transition:filter .15s,transform .15s}.gvpn-button-row .cbi-button:hover{filter:brightness(1.08);transform:translateY(-1px)}.gvpn-button-start{background:#16803c!important;color:white!important;border-color:#16803c!important}.gvpn-button-stop{background:#c62828!important;color:white!important;border-color:#c62828!important}.gvpn-button-restart{background:#1d70c9!important;color:white!important;border-color:#1d70c9!important}.gvpn-button-autostart{background:#52627a!important;color:white!important;border-color:#52627a!important}.gvpn-page,.gvpn-page *{font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif}.gvpn-page input,.gvpn-page code{direction:ltr;text-align:left}.gvpn-hero h2{display:flex;align-items:center;gap:12px;direction:ltr;justify-content:flex-end}.gvpn-version{padding:4px 9px;border:1px solid rgba(255,255,255,.35);border-radius:999px;background:rgba(255,255,255,.12);font-size:13px;font-weight:600}.gvpn-page .cbi-map-descr{line-height:1.8}@media(max-width:600px){.gvpn-hero{padding:17px 20px}.gvpn-hero h2{font-size:22px}.gvpn-card{padding:15px}.gvpn-button-row .cbi-button{flex:1 1 auto}}'),
+			E('style', {}, '.gvpn-dashboard{--gvpn-muted:#8191a8;max-width:1120px;margin:18px auto 24px}.gvpn-hero{position:relative;overflow:hidden;padding:20px 28px;border-radius:18px;background:linear-gradient(120deg,#102947,#155c9d 62%,#3186e5);color:#fff;box-shadow:0 14px 34px rgba(22,71,122,.22)}.gvpn-hero:after{content:"";position:absolute;width:210px;height:210px;border:1px solid rgba(255,255,255,.18);border-radius:50%;right:8%;top:-118px;box-shadow:0 0 0 28px rgba(255,255,255,.05),0 0 0 58px rgba(255,255,255,.035)}.gvpn-hero h2{position:relative;z-index:1;margin:0;color:#fff;font-size:26px}.gvpn-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:16px 0}.gvpn-card{padding:18px 20px;border:1px solid rgba(91,119,158,.2);border-radius:14px;background:var(--background-color-high,#fff);box-shadow:0 5px 18px rgba(22,42,76,.08)}.gvpn-card h3{margin:0 0 12px;font-size:15px}.gvpn-stat{display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--gvpn-muted)}.gvpn-card code{direction:ltr;display:inline-block;max-width:100%;overflow-wrap:anywhere}.gvpn-dashboard .label{padding:5px 11px;border-radius:9px;font-weight:700}.gvpn-state-on{background:#15803d!important;color:#fff!important;border:1px solid #15803d}.gvpn-state-off{background:#c62828!important;color:#fff!important;border:1px solid #c62828}.gvpn-note{margin:18px 0 12px;padding:12px 16px;border:1px solid #b8d6fa;border-radius:12px;background:#edf5ff;color:#24466d;line-height:1.9}.gvpn-feedback{margin-top:10px}.gvpn-button-row{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0 20px}.gvpn-button-row .cbi-button{margin:0!important;padding:8px 18px;border:1px solid transparent;border-radius:10px;font-weight:700;transition:filter .15s,transform .15s}.gvpn-button-row .cbi-button:hover{filter:brightness(1.08);transform:translateY(-1px)}.gvpn-button-start{background:#16803c!important;color:white!important;border-color:#16803c!important}.gvpn-button-stop{background:#c62828!important;color:white!important;border-color:#c62828!important}.gvpn-button-restart{background:#1d70c9!important;color:white!important;border-color:#1d70c9!important}.gvpn-button-autostart{background:#52627a!important;color:white!important;border-color:#52627a!important}.gvpn-button-ca{display:inline-flex;align-items:center;gap:7px;background:linear-gradient(135deg,#b8460e,#e8791b)!important;color:#fff!important;border-color:#b8460e!important;text-decoration:none!important;box-shadow:0 3px 10px rgba(184,70,14,.34)}.gvpn-button-ca:before{content:"\\1F512";font-size:14px}.gvpn-button-ca:hover{color:#fff!important;text-decoration:none!important}.gvpn-page,.gvpn-page *{font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif}.gvpn-page input,.gvpn-page code{direction:ltr;text-align:left}.gvpn-hero h2{display:flex;align-items:center;gap:12px;direction:ltr;justify-content:flex-end}.gvpn-version{padding:4px 9px;border:1px solid rgba(255,255,255,.35);border-radius:999px;background:rgba(255,255,255,.12);font-size:13px;font-weight:600}.gvpn-page .cbi-map-descr{line-height:1.8}@media(max-width:600px){.gvpn-hero{padding:17px 20px}.gvpn-hero h2{font-size:22px}.gvpn-card{padding:15px}.gvpn-button-row .cbi-button{flex:1 1 auto}}'),
 			E('div', { 'class': 'gvpn-hero' }, [
-				E('h2', {}, [ E('span', { 'class': 'gvpn-version', 'dir': 'ltr' }, 'v__GVPN_VERSION__'), 'GVPN Manager' ])
+				E('h2', {}, [ E('span', { 'class': 'gvpn-version', 'dir': 'rtl' }, versionLabel('__GVPN_VERSION__')), 'GVPN Manager' ])
 			]),
 			E('div', { 'class': 'gvpn-cards' }, [
-				E('section', { 'class': 'gvpn-card' }, [ E('h3', {}, _('وضعیت سرویس')), E('div', { 'class': 'gvpn-stat' }, [ _('هسته GVPN: '), state ]), E('div', { 'class': 'gvpn-stat' }, [ _('هدایت LAN: '), transparentState = E('span', { 'class': status.transparent ? 'label gvpn-state gvpn-state-on' : 'label gvpn-state gvpn-state-off' }, status.transparent ? _('فعال') : _('غیرفعال')) ]), E('div', { 'class': 'gvpn-stat' }, [ _('اجرای خودکار روتر: '), startup ]) ]),
+				E('section', { 'class': 'gvpn-card' }, [ E('h3', {}, _('وضعیت سرویس')), E('div', { 'class': 'gvpn-stat' }, [ _('هسته GVPN: '), state ]), E('div', { 'class': 'gvpn-stat' }, [ _('هدایت LAN: '), transparentState = E('span', { 'class': status.transparent ? 'label gvpn-state gvpn-state-on' : 'label gvpn-state gvpn-state-off' }, status.transparent ? _('فعال') : _('غیرفعال')) ]), E('div', { 'class': 'gvpn-stat' }, [ _('اجرای خودکار: '), startup ]) ]),
 				E('section', { 'class': 'gvpn-card' }, [ E('h3', {}, _('نشانی‌های پراکسی')), E('div', { 'class': 'gvpn-stat' }, [ _('HTTP: '), endpoint ]), E('div', { 'class': 'gvpn-stat' }, [ _('SOCKS5: '), socksEndpoint ]) ]),
 				E('section', { 'class': 'gvpn-card' }, [ E('h3', {}, _('مدیریت AUTH_KEY')), keyToggle, E('p', {}, savedKey) ])
 			]),
-			E('div', { 'class': 'gvpn-note', 'style': 'display:none' }, _('حالت Full فقط با CodeFull.gs و tunnel-node فعال روی VPS یا Cloud Run کار می‌کند. بدون سرور تونل، هدایت خودکار LAN را فعال نکنید.')),
+			E('div', { 'class': 'gvpn-note', 'style': 'display:none' }, _('حالت Full فقط با CodeFull.gs و tunnel-node فعال روی VPS یا Cloud Run کار می‌کند.')),
+			E('p', { 'class': 'gvpn-ca-guide', 'style': 'display:none;direction:rtl;line-height:1.9;margin:8px 0 14px' }, [
+				E('strong', {}, _('گواهی برای حالت Apps Script: ')),
+				_('اگر هدایت LAN یا پراکسی HTTPS را فعال می‌کنید، گواهی عمومی CA روتر را روی هر دستگاهی که خودتان کنترل می‌کنید نصب و برای HTTPS مورد اعتماد کنید. بدون آن، مرورگر باید خطای گواهی نشان دهد. برخی برنامه‌ها حتی پس از نصب CA کار نمی‌کنند. اعتماد به CA به روتر امکان مشاهدهٔ محتوای HTTPS را می‌دهد. دکمهٔ دریافت گواهی در ردیف دکمه‌های زیر است.')
+			]),
 			E('div', { 'class': 'gvpn-button-row' }, [
 				E('button', { 'class': 'cbi-button gvpn-button-start', 'click': ui.createHandlerFn(this, function() {
 					return service('start', _('سرویس شروع شد.'));
@@ -196,12 +214,7 @@ return view.extend({
 					return service('restart', _('سرویس دوباره راه‌اندازی شد.'));
 				}) }, _('راه‌اندازی مجدد')),
 				' ',
-				E('button', { 'class': 'cbi-button gvpn-button-autostart', 'click': ui.createHandlerFn(this, function() {
-					var action = status.autostart ? 'disable' : 'enable';
-					return service(action, action === 'enable' ? _('اجرای خودکار فعال شد.') : _('اجرای خودکار غیرفعال شد.')).then(function() {
-						status.autostart = !status.autostart;
-					});
-				}) }, _('تغییر اجرای خودکار'))
+				E('a', { 'class': 'cbi-button gvpn-button-ca', 'href': 'http://' + window.location.hostname + '/cgi-bin/gvpn-ca.crt', 'target': '_blank', 'rel': 'noopener', 'download': 'gvpn-ca.crt' }, _('دریافت گواهی CA'))
 			]),
 			E('div', { 'class': 'gvpn-feedback' }, [ feedback ])
 		]);
@@ -215,8 +228,10 @@ return view.extend({
 		return m.render().then(function(formNode) {
 			var modeInput = formNode.querySelector('select[id$=".mode"]');
 			var fullNote = panel.querySelector('.gvpn-note');
+			var caNote = panel.querySelector('.gvpn-ca-guide');
 			function updateFullNote() {
 				fullNote.style.display = modeInput && modeInput.value === 'full' ? '' : 'none';
+				caNote.style.display = modeInput && modeInput.value === 'apps_script' ? '' : 'none';
 			}
 			if (modeInput) {
 				modeInput.addEventListener('change', updateFullNote);

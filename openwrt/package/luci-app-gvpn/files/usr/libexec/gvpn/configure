@@ -39,8 +39,8 @@ case "$listen_port:$socks5_port" in *[!0-9:]*) echo "ports must be numeric" >&2;
 case "$log_level" in error|warn|info|debug|trace) ;; *) echo "unsupported log level" >&2; exit 1 ;; esac
 case "$verify_ssl" in 0|1) ;; *) echo "verify_ssl must be 0 or 1" >&2; exit 1 ;; esac
 case "$lan_proxy_enabled" in 0|1) ;; *) echo "lan_proxy_enabled must be 0 or 1" >&2; exit 1 ;; esac
-if [ "$lan_proxy_enabled" = 1 ] && [ "$mode" != full ]; then
-	echo "automatic LAN routing requires Full mode; deploy CodeFull.gs and configure tunnel-node first" >&2
+if [ "$lan_proxy_enabled" = 1 ] && [ "$mode" = direct ]; then
+	echo "automatic LAN routing requires Apps Script web relay or Full mode" >&2
 	exit 1
 fi
 
