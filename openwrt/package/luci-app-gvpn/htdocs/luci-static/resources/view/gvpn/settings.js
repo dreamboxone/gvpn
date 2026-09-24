@@ -36,6 +36,10 @@ return view.extend({
 	},
 
 	render: function(status) {
+		if (!document.getElementById('gvpn-font-style')) {
+			var fontStyle = E('style', { 'id': 'gvpn-font-style' }, '@font-face{font-family:GVPN-Vazirmatn;src:url(/luci-static/resources/gvpn/Vazirmatn-wght.woff2) format("woff2");font-style:normal;font-weight:100 900;font-display:swap}.gvpn-page,.gvpn-page *,#modal,.modal,.modal *{font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif!important}.gvpn-page .cbi-input-invalid + .cbi-tooltip-container,.gvpn-page .cbi-tooltip-error{direction:rtl;text-align:right}');
+			document.head.appendChild(fontStyle);
+		}
 		var state = E('span', { 'class': 'label gvpn-state gvpn-state-off' }, _('نامشخص'));
 		var startup = E('span', {}, _('نامشخص'));
 		var endpoint = E('span', {}, '—');
@@ -89,6 +93,8 @@ return view.extend({
 			return saveForm.call(this, callback, true).catch(function(err) {
 				if (!silent) {
 					var detail = err && err.message ? err.message : String(err);
+					if (detail.indexOf('contains an invalid input value') !== -1)
+						detail = 'مقدار یکی از فیلدها معتبر نیست. فیلد قرمز را بررسی کنید. برای Deployment ID فقط شناسهٔ کامل را از Google Apps Script وارد کنید.';
 					var modal = ui.showModal('خطا در ذخیره‌سازی', [
 						E('div', { 'dir': 'rtl', 'lang': 'fa', 'style': 'font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif;text-align:right' }, [
 							E('p', {}, 'ذخیرهٔ تنظیمات انجام نشد:'),
@@ -120,10 +126,10 @@ return view.extend({
 
 		var scripts = s.option(form.DynamicList, 'script_ids', _('Deployment IDهای گوگل'));
 		scripts.rmempty = true;
-		scripts.placeholder = 'AKfycb...';
-		scripts.description = _('هر شناسه را جداگانه اضافه کنید؛ موارد ذخیره‌شده نمایش داده می‌شوند و با دکمهٔ حذف کنار هر مورد پاک می‌شوند. همه با AUTH_KEY مشترک کار می‌کنند.');
+		scripts.placeholder = _('شناسهٔ کامل را وارد کنید');
+		scripts.description = _('شناسهٔ کامل را از Manage deployments در Google Apps Script کپی کنید. زیرخط (_) و خط تیره (-) مجازند. نشانی /exec را وارد نکنید؛ هر شناسه را با دکمهٔ + اضافه کنید.');
 		scripts.validate = function(section_id, value) {
-			return /^[A-Za-z0-9_-]+$/.test(value) ? true : _('شناسه فقط می‌تواند شامل حروف انگلیسی، عدد، خط تیره و زیرخط باشد.');
+			return !value || /^[A-Za-z0-9_-]+$/.test(value) ? true : _('این مقدار شامل نویسهٔ نامعتبر است. فقط حروف انگلیسی، عدد، زیرخط (_) و خط تیره (-) مجازند.');
 		};
 
 		var key = s.option(form.Value, 'auth_key', _('کلید احراز هویت واسط'));
@@ -168,7 +174,6 @@ return view.extend({
 
 		var panel = E('div', { 'class': 'gvpn-dashboard' }, [
 			E('style', {}, '.gvpn-dashboard{--gvpn-muted:#8191a8;max-width:1120px;margin:18px auto 24px}.gvpn-hero{position:relative;overflow:hidden;padding:20px 28px;border-radius:18px;background:linear-gradient(120deg,#102947,#155c9d 62%,#3186e5);color:#fff;box-shadow:0 14px 34px rgba(22,71,122,.22)}.gvpn-hero:after{content:"";position:absolute;width:210px;height:210px;border:1px solid rgba(255,255,255,.18);border-radius:50%;right:8%;top:-118px;box-shadow:0 0 0 28px rgba(255,255,255,.05),0 0 0 58px rgba(255,255,255,.035)}.gvpn-hero h2{position:relative;z-index:1;margin:0;color:#fff;font-size:26px}.gvpn-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:16px 0}.gvpn-card{padding:18px 20px;border:1px solid rgba(91,119,158,.2);border-radius:14px;background:var(--background-color-high,#fff);box-shadow:0 5px 18px rgba(22,42,76,.08)}.gvpn-card h3{margin:0 0 12px;font-size:15px}.gvpn-stat{display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--gvpn-muted)}.gvpn-card code{direction:ltr;display:inline-block;max-width:100%;overflow-wrap:anywhere}.gvpn-dashboard .label{padding:5px 11px;border-radius:9px;font-weight:700}.gvpn-state-on{background:#15803d!important;color:#fff!important;border:1px solid #15803d}.gvpn-state-off{background:#c62828!important;color:#fff!important;border:1px solid #c62828}.gvpn-note{margin:18px 0 12px;padding:12px 16px;border:1px solid #b8d6fa;border-radius:12px;background:#edf5ff;color:#24466d;line-height:1.9}.gvpn-feedback{margin-top:10px}.gvpn-button-row{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0 20px}.gvpn-button-row .cbi-button{margin:0!important;padding:8px 18px;border:1px solid transparent;border-radius:10px;font-weight:700;transition:filter .15s,transform .15s}.gvpn-button-row .cbi-button:hover{filter:brightness(1.08);transform:translateY(-1px)}.gvpn-button-start{background:#16803c!important;color:white!important;border-color:#16803c!important}.gvpn-button-stop{background:#c62828!important;color:white!important;border-color:#c62828!important}.gvpn-button-restart{background:#1d70c9!important;color:white!important;border-color:#1d70c9!important}.gvpn-button-autostart{background:#52627a!important;color:white!important;border-color:#52627a!important}.gvpn-page,.gvpn-page *{font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif}.gvpn-page input,.gvpn-page code{direction:ltr;text-align:left}.gvpn-hero h2{display:flex;align-items:center;gap:12px;direction:ltr;justify-content:flex-end}.gvpn-version{padding:4px 9px;border:1px solid rgba(255,255,255,.35);border-radius:999px;background:rgba(255,255,255,.12);font-size:13px;font-weight:600}.gvpn-page .cbi-map-descr{line-height:1.8}@media(max-width:600px){.gvpn-hero{padding:17px 20px}.gvpn-hero h2{font-size:22px}.gvpn-card{padding:15px}.gvpn-button-row .cbi-button{flex:1 1 auto}}'),
-			E('style', {}, '@font-face{font-family:GVPN-Vazirmatn;src:url(/luci-static/resources/gvpn/Vazirmatn-wght.woff2) format("woff2");font-style:normal;font-weight:100 900;font-display:swap}'),
 			E('div', { 'class': 'gvpn-hero' }, [
 				E('h2', {}, [ E('span', { 'class': 'gvpn-version', 'dir': 'ltr' }, 'v__GVPN_VERSION__'), 'GVPN Manager' ])
 			]),
@@ -208,6 +213,14 @@ return view.extend({
 		poll.add(refresh, 5);
 
 		return m.render().then(function(formNode) {
+			var scriptInput = formNode.querySelector('input[id$=".script_ids"]');
+			if (scriptInput) {
+				scriptInput.addEventListener('input', function() {
+					var cleaned = this.value.replace(/\\_/g, '_').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+					if (cleaned !== this.value)
+						this.value = cleaned;
+				});
+			}
 			return E('div', { 'class': 'cbi-map gvpn-page', 'dir': 'rtl', 'lang': 'fa' }, [ panel, formNode ]);
 		});
 	}
