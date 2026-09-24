@@ -36,7 +36,7 @@ return view.extend({
 	},
 
 	render: function(status) {
-		var state = E('span', { 'class': 'label' }, _('نامشخص'));
+		var state = E('span', { 'class': 'label gvpn-state gvpn-state-off' }, _('نامشخص'));
 		var startup = E('span', {}, _('نامشخص'));
 		var endpoint = E('span', {}, '—');
 		var socksEndpoint = E('span', {}, '—');
@@ -62,15 +62,15 @@ return view.extend({
 				status.running = current.running;
 				status.autostart = current.autostart;
 				state.textContent = current.running ? _('در حال اجرا') : _('متوقف');
-				state.className = current.running ? 'label label-success' : 'label label-warning';
+				state.className = current.running ? 'label gvpn-state gvpn-state-on' : 'label gvpn-state gvpn-state-off';
 				startup.textContent = current.autostart ? _('فعال') : _('غیرفعال');
 				if (transparentState) {
 					transparentState.textContent = current.transparent ? _('فعال') : _('غیرفعال');
-					transparentState.className = current.transparent ? 'label label-success' : 'label label-warning';
+					transparentState.className = current.transparent ? 'label gvpn-state gvpn-state-on' : 'label gvpn-state gvpn-state-off';
 				}
 			}).catch(function() {
 				state.textContent = _('وضعیت در دسترس نیست');
-				state.className = 'label label-danger';
+				state.className = 'label gvpn-state gvpn-state-off';
 			});
 		}
 
@@ -135,11 +135,11 @@ return view.extend({
 		host.value('0.0.0.0', _('همه رابط‌های روتر (دستگاه‌های شبکه محلی)'));
 		host.value('127.0.0.1', _('فقط خود روتر'));
 
-		var http = s.option(form.Value, 'listen_port', _('درگاه پراکسی HTTP'));
+		var http = s.option(form.Value, 'listen_port', _('پورت پراکسی HTTP'));
 		http.datatype = 'port';
 		http.placeholder = '8085';
 
-		var socks = s.option(form.Value, 'socks5_port', _('درگاه پراکسی SOCKS5'));
+		var socks = s.option(form.Value, 'socks5_port', _('پورت پراکسی SOCKS5'));
 		socks.datatype = 'port';
 		socks.placeholder = '8086';
 
@@ -148,7 +148,7 @@ return view.extend({
 
 		var lanProxy = s.option(form.Flag, 'lan_proxy_enabled', _('هدایت خودکار ترافیک LAN با TPROXY'));
 		lanProxy.default = '0';
-		lanProxy.description = _('وقتی فعال باشد، OpenWrt ترافیک TCP و UDP عبوری LAN را بدون تنظیم دستگاه‌ها به GVPN Full می‌فرستد. برای جلوگیری از نشت DNS، DNSهای DHCPv4/v6 شبکه‌های انتخابی موقتاً به DNS عمومی گوگل تغییر می‌کنند و با خاموش‌کردن این گزینه مقدارهای قبلی برمی‌گردند؛ نام‌های محلی ممکن است در زمان فعال‌بودن resolve نشوند. ICMP و ترافیک خود روتر از این مسیر عبور نمی‌کنند. اجرای خودکار سرویس نیز فعال می‌شود.');
+		lanProxy.description = _('با فعال‌کردن این گزینه، OpenWrt ترافیک TCP و UDP عبوری شبکه LAN را بدون نیاز به تنظیم دستگاه‌ها به GVPN Full می‌فرستد. برای جلوگیری از نشت DNS، DNSهای DHCPv4/v6 شبکه‌های انتخابی موقتا به DNS عمومی گوگل تغییر می‌کنند و با خاموش‌کردن گزینه به مقدار قبلی برمی‌گردند. در این حالت ممکن است نام دستگاه‌های محلی باز نشود. ترافیک ICMP و ترافیک خود روتر از این مسیر عبور نمی‌کند. اجرای خودکار سرویس هم فعال می‌شود.');
 
 		var lanDevices = s.option(form.DynamicList, 'lan_devices', _('رابط‌های LAN برای هدایت'));
 		lanDevices.default = [ 'br-lan' ];
@@ -167,39 +167,38 @@ return view.extend({
 		this._service = service;
 
 		var panel = E('div', { 'class': 'gvpn-dashboard' }, [
-			E('style', {}, '.gvpn-dashboard{--gvpn-accent:#2474e5;--gvpn-ink:#17233b;--gvpn-muted:#62718a;max-width:1120px;margin:18px auto 24px;color:var(--gvpn-ink)}.gvpn-hero{position:relative;overflow:hidden;padding:28px 32px;border-radius:18px;background:linear-gradient(120deg,#102947,#155c9d 62%,#3186e5);color:#fff;box-shadow:0 14px 34px rgba(22,71,122,.22)}.gvpn-hero:after{content:"";position:absolute;width:210px;height:210px;border:1px solid rgba(255,255,255,.18);border-radius:50%;right:8%;top:-118px;box-shadow:0 0 0 28px rgba(255,255,255,.05),0 0 0 58px rgba(255,255,255,.035)}.gvpn-hero h2{margin:0 0 8px;color:#fff;font-size:26px}.gvpn-hero p{position:relative;z-index:1;margin:0;max-width:680px;color:#e2efff;line-height:1.9}.gvpn-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:16px 0}.gvpn-card{padding:18px 20px;border:1px solid rgba(91,119,158,.16);border-radius:14px;background:var(--background-color-high,#fff);box-shadow:0 5px 18px rgba(22,42,76,.055)}.gvpn-card h3{margin:0 0 12px;font-size:15px}.gvpn-stat{display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--gvpn-muted)}.gvpn-card code{direction:ltr;display:inline-block;max-width:100%;overflow-wrap:anywhere;color:#254f82}.gvpn-actions{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}.gvpn-actions .cbi-button{border-radius:9px;padding:7px 14px}.gvpn-note{padding:12px 15px;border-radius:10px;background:#eef5ff;color:#315780;line-height:1.8}.gvpn-dashboard .label{padding:5px 9px;border-radius:20px}.gvpn-dashboard+ .cbi-map-descr{line-height:1.8}@media(max-width:600px){.gvpn-hero{padding:22px}.gvpn-hero h2{font-size:22px}.gvpn-card{padding:15px}}'),
-			E('style', {}, '@font-face{font-family:GVPN-Vazirmatn;src:url(/luci-static/resources/gvpn/Vazirmatn-wght.woff2) format("woff2");font-style:normal;font-weight:100 900;font-display:swap}.gvpn-page{direction:rtl;font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif}.gvpn-page button,.gvpn-page input,.gvpn-page textarea{font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif}.gvpn-page input,.gvpn-page code{direction:ltr;text-align:left}.gvpn-hero h2{display:flex;align-items:center;gap:12px;direction:ltr;justify-content:flex-end}.gvpn-version{padding:4px 9px;border:1px solid rgba(255,255,255,.35);border-radius:999px;background:rgba(255,255,255,.12);font-size:13px;font-weight:600}'),
+			E('style', {}, '.gvpn-dashboard{--gvpn-muted:#8191a8;max-width:1120px;margin:18px auto 24px}.gvpn-hero{position:relative;overflow:hidden;padding:20px 28px;border-radius:18px;background:linear-gradient(120deg,#102947,#155c9d 62%,#3186e5);color:#fff;box-shadow:0 14px 34px rgba(22,71,122,.22)}.gvpn-hero:after{content:"";position:absolute;width:210px;height:210px;border:1px solid rgba(255,255,255,.18);border-radius:50%;right:8%;top:-118px;box-shadow:0 0 0 28px rgba(255,255,255,.05),0 0 0 58px rgba(255,255,255,.035)}.gvpn-hero h2{position:relative;z-index:1;margin:0;color:#fff;font-size:26px}.gvpn-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:16px 0}.gvpn-card{padding:18px 20px;border:1px solid rgba(91,119,158,.2);border-radius:14px;background:var(--background-color-high,#fff);box-shadow:0 5px 18px rgba(22,42,76,.08)}.gvpn-card h3{margin:0 0 12px;font-size:15px}.gvpn-stat{display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--gvpn-muted)}.gvpn-card code{direction:ltr;display:inline-block;max-width:100%;overflow-wrap:anywhere}.gvpn-dashboard .label{padding:5px 11px;border-radius:9px;font-weight:700}.gvpn-state-on{background:#15803d!important;color:#fff!important;border:1px solid #15803d}.gvpn-state-off{background:#c62828!important;color:#fff!important;border:1px solid #c62828}.gvpn-note{margin:18px 0 12px;padding:12px 16px;border:1px solid #b8d6fa;border-radius:12px;background:#edf5ff;color:#24466d;line-height:1.9}.gvpn-feedback{margin-top:10px}.gvpn-button-row{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0 20px}.gvpn-button-row .cbi-button{margin:0!important;padding:8px 18px;border:1px solid transparent;border-radius:10px;font-weight:700;transition:filter .15s,transform .15s}.gvpn-button-row .cbi-button:hover{filter:brightness(1.08);transform:translateY(-1px)}.gvpn-button-start{background:#16803c!important;color:white!important;border-color:#16803c!important}.gvpn-button-stop{background:#c62828!important;color:white!important;border-color:#c62828!important}.gvpn-button-restart{background:#1d70c9!important;color:white!important;border-color:#1d70c9!important}.gvpn-button-autostart{background:#52627a!important;color:white!important;border-color:#52627a!important}.gvpn-page,.gvpn-page *{font-family:GVPN-Vazirmatn,Vazirmatn,sans-serif}.gvpn-page input,.gvpn-page code{direction:ltr;text-align:left}.gvpn-hero h2{display:flex;align-items:center;gap:12px;direction:ltr;justify-content:flex-end}.gvpn-version{padding:4px 9px;border:1px solid rgba(255,255,255,.35);border-radius:999px;background:rgba(255,255,255,.12);font-size:13px;font-weight:600}.gvpn-page .cbi-map-descr{line-height:1.8}@media(max-width:600px){.gvpn-hero{padding:17px 20px}.gvpn-hero h2{font-size:22px}.gvpn-card{padding:15px}.gvpn-button-row .cbi-button{flex:1 1 auto}}'),
+			E('style', {}, '@font-face{font-family:GVPN-Vazirmatn;src:url(/luci-static/resources/gvpn/Vazirmatn-wght.woff2) format("woff2");font-style:normal;font-weight:100 900;font-display:swap}'),
 			E('div', { 'class': 'gvpn-hero' }, [
-				E('h2', {}, [ 'GVPN Manager', E('span', { 'class': 'gvpn-version', 'dir': 'ltr' }, 'v__GVPN_VERSION__') ]),
-				E('p', {}, _('مدیریت یکپارچهٔ رلهٔ گوگل، کلیدها و هدایت شفاف شبکهٔ محلی. تنظیمات را یک‌بار انجام دهید؛ دستگاه‌های LAN به تنظیم پراکسی نیاز ندارند.'))
+				E('h2', {}, [ E('span', { 'class': 'gvpn-version', 'dir': 'ltr' }, 'v__GVPN_VERSION__'), 'GVPN Manager' ])
 			]),
 			E('div', { 'class': 'gvpn-cards' }, [
-				E('section', { 'class': 'gvpn-card' }, [ E('h3', {}, _('وضعیت سرویس')), E('div', { 'class': 'gvpn-stat' }, [ _('هستهٔ GVPN: '), state ]), E('div', { 'class': 'gvpn-stat' }, [ _('هدایت LAN: '), transparentState = E('span', { 'class': 'label label-warning' }, status.transparent ? _('فعال') : _('غیرفعال')) ]), E('div', { 'class': 'gvpn-stat' }, [ _('اجرای خودکار روتر: '), startup ]) ]),
+				E('section', { 'class': 'gvpn-card' }, [ E('h3', {}, _('وضعیت سرویس')), E('div', { 'class': 'gvpn-stat' }, [ _('هسته GVPN: '), state ]), E('div', { 'class': 'gvpn-stat' }, [ _('هدایت LAN: '), transparentState = E('span', { 'class': status.transparent ? 'label gvpn-state gvpn-state-on' : 'label gvpn-state gvpn-state-off' }, status.transparent ? _('فعال') : _('غیرفعال')) ]), E('div', { 'class': 'gvpn-stat' }, [ _('اجرای خودکار روتر: '), startup ]) ]),
 				E('section', { 'class': 'gvpn-card' }, [ E('h3', {}, _('نشانی‌های پراکسی')), E('div', { 'class': 'gvpn-stat' }, [ _('HTTP: '), endpoint ]), E('div', { 'class': 'gvpn-stat' }, [ _('SOCKS5: '), socksEndpoint ]) ]),
 				E('section', { 'class': 'gvpn-card' }, [ E('h3', {}, _('مدیریت AUTH_KEY')), keyToggle, E('p', {}, savedKey) ])
 			]),
-			E('div', { 'class': 'gvpn-note' }, _('نکتهٔ راه‌اندازی Full: ابتدا CodeFull.gs و tunnel-node را مطابق راهنمای پروژه فعال کنید، سپس کلید مشترک و شناسه‌های Deployment را وارد کنید. برای جلوگیری از نشت DNS، هنگام فعال‌بودن TPROXY، DNSهای DHCP شبکهٔ انتخابی موقتاً با DNS عمومی گوگل جایگزین می‌شوند و با خاموش‌کردن به مقدار قبلی برمی‌گردند.')),
-			E('div', { 'class': 'cbi-button-row' }, [
-				E('button', { 'class': 'cbi-button cbi-button-action', 'click': ui.createHandlerFn(this, function() {
+			E('div', { 'class': 'gvpn-note' }, _('برای فعالسازی حالت Full لازم است فایل های CodeFull.gs و tunnel-node را مطابق راهنما فعال نمایید. سپس Auth Key و Deployment ID را وارد کنید. برای جلوگیری از نشت DNS، هنگام فعال‌بودن TPROXY، DNSهای DHCP شبکهٔ انتخابی موقتا با DNS عمومی گوگل جایگزین می‌شوند و با خاموش‌کردن به مقدار قبلی برمی‌گردند.')),
+			E('div', { 'class': 'gvpn-button-row' }, [
+				E('button', { 'class': 'cbi-button gvpn-button-start', 'click': ui.createHandlerFn(this, function() {
 					return service('start', _('سرویس شروع شد.'));
 				}) }, _('شروع')),
 				' ',
-				E('button', { 'class': 'cbi-button', 'click': ui.createHandlerFn(this, function() {
+				E('button', { 'class': 'cbi-button gvpn-button-stop', 'click': ui.createHandlerFn(this, function() {
 					return service('stop', _('سرویس متوقف شد.'));
 				}) }, _('توقف')),
 				' ',
-				E('button', { 'class': 'cbi-button', 'click': ui.createHandlerFn(this, function() {
+				E('button', { 'class': 'cbi-button gvpn-button-restart', 'click': ui.createHandlerFn(this, function() {
 					return service('restart', _('سرویس دوباره راه‌اندازی شد.'));
 				}) }, _('راه‌اندازی مجدد')),
 				' ',
-				E('button', { 'class': 'cbi-button', 'click': ui.createHandlerFn(this, function() {
+				E('button', { 'class': 'cbi-button gvpn-button-autostart', 'click': ui.createHandlerFn(this, function() {
 					var action = status.autostart ? 'disable' : 'enable';
 					return service(action, action === 'enable' ? _('اجرای خودکار فعال شد.') : _('اجرای خودکار غیرفعال شد.')).then(function() {
 						status.autostart = !status.autostart;
 					});
 				}) }, _('تغییر اجرای خودکار'))
 			]),
-			feedback
+			E('div', { 'class': 'gvpn-feedback' }, [ feedback ])
 		]);
 
 		var hostValue = uci.get('gvpn', 'main', 'listen_host') || '0.0.0.0';

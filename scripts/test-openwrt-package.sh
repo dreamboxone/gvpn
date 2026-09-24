@@ -8,6 +8,8 @@ ARCH="$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\([^"]*\)"$/\1/p' "${SDK_ROOT}/.
 [[ -n "${ARCH}" ]] || { echo "Unable to read package architecture from SDK" >&2; exit 1; }
 DIST_DIR="${REPO_ROOT}/dist/openwrt/${ARCH}"
 APK="${SDK_ROOT}/staging_dir/host/bin/apk"
+PKG_VERSION="$(sed -n 's/^PKG_VERSION:=\(.*\)$/\1/p' "${REPO_ROOT}/openwrt/package/luci-app-gvpn/Makefile")"
+PKG_RELEASE="$(sed -n 's/^PKG_RELEASE:=\(.*\)$/\1/p' "${REPO_ROOT}/openwrt/package/luci-app-gvpn/Makefile")"
 CHECK_DIR="$(mktemp -d)"
 trap 'rm -rf "${CHECK_DIR}"' EXIT
 
@@ -20,8 +22,8 @@ python3 -m json.tool "${REPO_ROOT}/openwrt/package/luci-app-gvpn/root/usr/share/
 python3 -m json.tool "${REPO_ROOT}/openwrt/package/luci-app-gvpn/root/usr/share/rpcd/acl.d/luci-app-gvpn.json" >/dev/null
 
 shopt -s nullglob
-PACKAGES=("${DIST_DIR}/luci-app-gvpn-"*.apk)
-[[ "${#PACKAGES[@]}" -eq 1 ]] || { echo "Expected one luci-app-gvpn APK" >&2; exit 1; }
+PACKAGES=("${DIST_DIR}/luci-app-gvpn-${PKG_VERSION}-r${PKG_RELEASE}"*.apk)
+[[ "${#PACKAGES[@]}" -eq 1 ]] || { echo "Expected one luci-app-gvpn ${PKG_VERSION}-r${PKG_RELEASE} APK" >&2; exit 1; }
 if compgen -G "${DIST_DIR}/gvpn-*.apk" >/dev/null; then
 	echo "Unexpected separate gvpn APK found" >&2
 	exit 1
