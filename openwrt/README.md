@@ -25,7 +25,7 @@ If `kmod-nft-tproxy` is unavailable for the running kernel, the SDK and firmware
 
 The “Google key” is not a Google Cloud API key. GVPN needs a private shared `AUTH_KEY` and one or more Apps Script Web App deployment IDs.
 
-1. Create an Apps Script project and replace its default `Code.gs` content with [`assets/apps_script/Code.gs`](../assets/apps_script/Code.gs). Set a strong random `AUTH_KEY` in the script and keep it for the LuCI form.
+1. Create an Apps Script project and replace its default `Code.gs` content with [`assets/apps_script/Code.gs`](../assets/apps_script/Code.gs). Set a strong random `AUTH_KEY` in the script and keep it for the LuCI form. If you already deployed `CodeFull.gs`, its web relay also works in Apps Script mode without a tunnel-node.
 2. In Apps Script, choose **Deploy → New deployment → Web app**. Set it to execute as **Me** and allow access by the router. Anyone who can reach an anonymously accessible deployment can attempt requests, so use a strong `AUTH_KEY` and protect it.
 3. Authorize the script if prompted. Copy the deployment ID from **Deploy → Manage deployments**. Enter the ID, not the full `/exec` URL, in LuCI.
 4. For multiple deployments, use the same `AUTH_KEY` in every copy. Add IDs one at a time to the LuCI list; saved IDs can be viewed or removed.
@@ -42,6 +42,8 @@ Official Google references: [Apps Script Web Apps](https://developers.google.com
 4. Check the engine status card. Enable service autostart if it should start on every boot.
 
 Apps Script alone cannot carry arbitrary TCP/UDP or transparently route the whole LAN. Do not enable GVPN TPROXY without a working Full-mode tunnel-node.
+
+For HTTPS, GVPN generates a local CA at `/etc/gvpn/data/mhrv-rs/ca/ca.crt`. Trust this public certificate only on client devices you control if you want to use HTTPS through the proxy. Never copy the adjacent private key `ca.key`. Trusting this CA permits the router to inspect HTTPS; without it, clients should reject the proxy certificate.
 
 ## Passwall2 and v2rayN
 

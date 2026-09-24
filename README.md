@@ -14,7 +14,7 @@
 
 Access to [script.google.com](https://script.google.com/) may be filtered. If it does not open, connect through a VPN to create or manage the Web App.
 
-1. Create a project at [script.google.com](https://script.google.com/) and replace its default `Code.gs` content with [`assets/apps_script/Code.gs`](assets/apps_script/Code.gs). Do not use `CodeFull.gs` for this VPS-free setup.
+1. Create a project at [script.google.com](https://script.google.com/) and replace its default `Code.gs` content with [`assets/apps_script/Code.gs`](assets/apps_script/Code.gs). This is the simplest VPS-free choice. An existing `CodeFull.gs` deployment also supports the web relay without a tunnel-node when GVPN is set to Apps Script mode.
 2. In the script, set a strong random value for `AUTH_KEY`. Keep it private; you will enter this same key in LuCI.
 3. Choose **Deploy → New deployment → Web app**. Set **Execute as** to **Me**, and set access as required by the script guide (the Web App must be reachable by the router). Approve Google's authorization prompt.
 4. Open **Deploy → Manage deployments** and copy the Deployment ID. Enter the ID only, not the full `/exec` URL.
@@ -37,6 +37,8 @@ Open **Services → GVPN Manager**. The page displays the installed package vers
 1. Enter the shared `AUTH_KEY` and add one or more Deployment IDs.
 2. Select **Apps Script** and leave **Automatic LAN routing with TPROXY** off. This mode does not support transparent whole-LAN TCP/UDP routing.
 3. Click **Save & Apply** and start the service. Configure an HTTP proxy on the client using the router's LAN IP and port `8085`, or a SOCKS5 proxy on port `8086`, for supported web traffic.
+
+HTTPS through this proxy uses a locally generated certificate authority. The router's public CA certificate is `/etc/gvpn/data/mhrv-rs/ca/ca.crt`; install it as a trusted root only on client devices you control if you choose to use HTTPS through GVPN. Never copy or share the adjacent `ca.key` private key. Trusting this CA lets the router inspect HTTPS traffic; without it, clients should reject the proxy's certificates.
 
 Do not enable GVPN TPROXY for the Apps Script-only path. It requires Full mode and a tunnel-node to handle arbitrary LAN TCP/UDP. A successful Apps Script deployment does not remove that limitation.
 

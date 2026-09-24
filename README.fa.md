@@ -19,7 +19,7 @@
 <p>دسترسی به <a href="https://script.google.com/">script.google.com</a> ممکن است فیلتر باشد. اگر سایت باز نمی‌شود، برای ساخت یا مدیریت اسکریپت ابتدا با فیلترشکن وارد شوید.</p>
 
 <ol>
-  <li>در <a href="https://script.google.com/">Google Apps Script</a> یک پروژه بسازید و محتوای فایل پیش‌فرض <code dir="ltr">Code.gs</code> را با <a href="assets/apps_script/Code.gs"><code dir="ltr">assets/apps_script/Code.gs</code></a> جایگزین کنید. برای این مسیر بدون VPS از <code dir="ltr">CodeFull.gs</code> استفاده نکنید.</li>
+  <li>در <a href="https://script.google.com/">Google Apps Script</a> یک پروژه بسازید و محتوای فایل پیش‌فرض <code dir="ltr">Code.gs</code> را با <a href="assets/apps_script/Code.gs"><code dir="ltr">assets/apps_script/Code.gs</code></a> جایگزین کنید. این ساده‌ترین انتخاب بدون VPS است. اگر از قبل <code dir="ltr">CodeFull.gs</code> منتشر کرده‌اید، بخش پراکسی وب آن هم در حالت Apps Script و بدون tunnel-node کار می‌کند.</li>
   <li>در کد، مقدار قوی و تصادفی برای <code dir="ltr">AUTH_KEY</code> بگذارید و آن را محرمانه نگه دارید؛ همین مقدار را بعداً در LuCI وارد می‌کنید.</li>
   <li>از مسیر <bdi dir="ltr">Deploy → New deployment → Web app</bdi> برنامه را منتشر کنید. گزینهٔ اجرا را روی <bdi dir="ltr">Me</bdi> بگذارید و دسترسی Web App را مطابق راهنمای پروژه تنظیم کنید تا روتر بتواند به آن وصل شود. اگر گوگل درخواست مجوز کرد، آن را تأیید کنید.</li>
   <li>در <bdi dir="ltr">Deploy → Manage deployments</bdi> شناسهٔ Deployment را کپی کنید. فقط خود شناسه را لازم دارید، نه نشانی کامل <code dir="ltr">/exec</code>.</li>
@@ -44,6 +44,8 @@
   <li>حالت <bdi dir="ltr">Apps Script</bdi> را انتخاب کنید و <code dir="ltr">TPROXY</code> را خاموش بگذارید.</li>
   <li><bdi dir="ltr">Save &amp; Apply</bdi> را بزنید و سرویس را راه‌اندازی کنید. روی دستگاه موردنظر پراکسی HTTP را با IP روتر و پورت <code dir="ltr">8085</code> یا SOCKS5 را با پورت <code dir="ltr">8086</code> تنظیم کنید.</li>
 </ol>
+
+<p>برای HTTPS، پراکسی گواهی‌هایی با مرجع صدور محلی خودش می‌سازد. گواهی عمومی روتر در <code dir="ltr">/etc/gvpn/data/mhrv-rs/ca/ca.crt</code> است؛ فقط اگر آگاهانه می‌خواهید HTTPS را از این پراکسی عبور دهید، آن را روی دستگاه‌های تحت کنترل خود به‌عنوان ریشهٔ مورد اعتماد نصب کنید. کلید خصوصی کنار آن، <code dir="ltr">ca.key</code>، را کپی یا منتشر نکنید. اعتماد به این گواهی به روتر امکان مشاهدهٔ محتوای HTTPS می‌دهد؛ بدون آن، دستگاه باید گواهی پراکسی را رد کند.</p>
 
 <p>برای مسیر Apps Script تنها، <code dir="ltr">TPROXY</code> را فعال نکنید. هدایت خودکار همهٔ ترافیک LAN به حالت Full و سرور <code dir="ltr">tunnel-node</code> نیاز دارد؛ انتشار موفق اسکریپت این محدودیت را برطرف نمی‌کند.</p>
 
