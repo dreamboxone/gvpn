@@ -80,9 +80,8 @@ on any platform with a serverless-fetch runtime.
    at mhrv-rs's proxy. You should see the real login page, not a CF
    challenge.
 
-A complete example config is at
-[`config.exit-node.example.json`](../../config.exit-node.example.json)
-in the repo root.
+The `[exit_node]` section of the config is documented in the
+`config.example.toml` template in the repo root.
 
 ### Hosting options
 
@@ -174,7 +173,6 @@ IP space is on CF's bot blocklist. Workarounds: try a different host
 
 - [Persian (راهنمای فارسی)](README.fa.md) version of this doc
 - [`exit_node.ts`](exit_node.ts) — the handler source (with hardening)
-- [`config.exit-node.example.json`](../../config.exit-node.example.json)
   — complete example mhrv-rs config
 - Issue [#382](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/382)
   — canonical thread tracking Cloudflare anti-bot

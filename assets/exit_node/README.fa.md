@@ -81,7 +81,7 @@ APIهای web-standard (`Request`، `Response`، `fetch`) استفاده می‌
    challenge.
 
 config مثال کامل در
-[`config.exit-node.example.json`](../../config.exit-node.example.json)
+`config.example.toml`
 در root repo.
 
 ### گزینه‌های hosting
@@ -173,7 +173,6 @@ space‌شون روی CF bot blocklist است. workarounds: host دیگه امت
 
 - [English version](README.md) of this doc
 - [`exit_node.ts`](exit_node.ts) — منبع handler (با hardening)
-- [`config.exit-node.example.json`](../../config.exit-node.example.json)
   — config مثال کامل
 - Issue [#382](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/382)
   — thread tracking canonical Cloudflare anti-bot

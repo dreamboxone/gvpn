@@ -336,8 +336,7 @@ pub struct Config {
     /// The cert returned by the upstream is validated against `sni` by
     /// rustls as normal — no custom SAN-allowlist needed, the front SNI
     /// must itself be a real domain hosted by the same edge as the
-    /// targets. Picking the right (ip, sni) pair is on the user; see
-    /// `docs/fronting-groups.md` for the recipe.
+    /// targets. Picking the right (ip, sni) pair is on the user.
     ///
     /// Group match wins over the built-in Google SNI-rewrite suffix list
     /// but loses to `passthrough_hosts` (explicit user opt-out wins) and
