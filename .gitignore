@@ -10,3 +10,6 @@
 /ios/MhrvVPN.xcodeproj/
 /ios/build/
 /ios/Local.xcconfig
+
+# Build artifacts belong in GitHub Releases, not in the history.
+releases/
