@@ -64,8 +64,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./scripts/build-openwrt.sh "$GITHUB_WORKSPACE/sdk"
-          ./scripts/test-openwrt-package.sh "$GITHUB_WORKSPACE/sdk"
+          bash ./scripts/build-openwrt.sh "$GITHUB_WORKSPACE/sdk"
+          bash ./scripts/test-openwrt-package.sh "$GITHUB_WORKSPACE/sdk"
           package=(dist/openwrt/${{ matrix.arch }}/luci-app-gvpn-*.apk)
           test "${#package[@]}" -eq 1
           mkdir -p release

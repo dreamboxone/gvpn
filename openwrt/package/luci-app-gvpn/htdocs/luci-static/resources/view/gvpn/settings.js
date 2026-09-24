@@ -161,7 +161,7 @@ return view.extend({
 		lanDevices.placeholder = 'br-lan';
 		lanDevices.description = _('نام bridge یا رابط لایهٔ ۳ شبکهٔ LAN را وارد کنید؛ معمولاً br-lan است. برای چند شبکه، هر رابط را جداگانه اضافه کنید. رابط WAN را اضافه نکنید.');
 		lanDevices.validate = function(section_id, value) {
-			return /^[A-Za-z0-9_.:-]+$/.test(value) ? true : _('نام رابط معتبر نیست.');
+			return !value || /^[A-Za-z0-9_.:-]+$/.test(value) ? true : _('نام رابط معتبر نیست.');
 		};
 
 		var log = s.option(form.ListValue, 'log_level', _('سطح گزارش'));
