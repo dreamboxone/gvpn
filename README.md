@@ -30,7 +30,7 @@
   | `luci-app-gvpn-aarch64_cortex-a53.apk` | `aarch64_cortex-a53` | Linksys MX4200 (ipq807x)، mediatek/filogic |
   | `luci-app-gvpn-aarch64_generic.apk` | `aarch64_generic` | armsr/armv8 و پردازنده‌های ARMv9 روی همان تارگت |
 
-- فایل‌های `.apk` فقط برای OpenWrt مبتنی بر APK هستند (۲۵.x). برای فیرمورهای قدیمی‌تر با `opkg` از فایل‌های `.ipk` استفاده کنید.
+- فقط OpenWrt مبتنی بر **APK** (نسخهٔ ۲۵.x و بالاتر) پشتیبانی می‌شود. فیرمورهای قدیمی‌تر که از `opkg` و بستهٔ `.ipk` استفاده می‌کنند فعلاً پشتیبانی نمی‌شوند، چون وابستگی `sing-box` در فید ۲۴.۱۰ ساخته نمی‌شود. این بسته‌ها را روی چنین فیرموری نصب نکنید.
 - یک حساب گوگل برای ساخت Apps Script.
 
 ## ۱. ساخت Google Apps Script و گرفتن Deployment ID و AUTH_KEY
