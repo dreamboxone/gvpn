@@ -118,11 +118,11 @@ return view.extend({
 		s.anonymous = true;
 
 		var mode = s.option(form.ListValue, 'mode', _('حالت اتصال'));
-		mode.value('full', _('Full — تونل کامل TCP/UDP و هدایت LAN'));
 		mode.value('apps_script', _('Apps Script — فقط پراکسی وب'));
+		mode.value('full', _('Full — تونل کامل TCP/UDP و هدایت LAN'));
 		mode.value('direct', _('اتصال مستقیم'));
-		mode.default = 'full';
-		mode.description = _('برای هدایت خودکار LAN باید Full را انتخاب کنید، CodeFull.gs را منتشر کرده باشید و tunnel-node را روی VPS یا Cloud Run اجرا کنید. Apps Script تنها، تونل عمومی TCP/UDP نیست.');
+		mode.default = 'apps_script';
+		mode.description = _('برای راه‌اندازی بدون VPS، فایل Code.gs را در Google Apps Script منتشر و حالت Apps Script را انتخاب کنید. این حالت برای پراکسی دستی وب است. Full و هدایت خودکار LAN به CodeFull.gs و tunnel-node روی VPS یا Cloud Run نیاز دارند.');
 
 		var scripts = s.option(form.DynamicList, 'script_ids', _('Deployment IDهای گوگل'));
 		scripts.rmempty = true;
@@ -182,7 +182,7 @@ return view.extend({
 				E('section', { 'class': 'gvpn-card' }, [ E('h3', {}, _('نشانی‌های پراکسی')), E('div', { 'class': 'gvpn-stat' }, [ _('HTTP: '), endpoint ]), E('div', { 'class': 'gvpn-stat' }, [ _('SOCKS5: '), socksEndpoint ]) ]),
 				E('section', { 'class': 'gvpn-card' }, [ E('h3', {}, _('مدیریت AUTH_KEY')), keyToggle, E('p', {}, savedKey) ])
 			]),
-			E('div', { 'class': 'gvpn-note' }, _('برای فعالسازی حالت Full لازم است فایل های CodeFull.gs و tunnel-node را مطابق راهنما فعال نمایید. سپس Auth Key و Deployment ID را وارد کنید. برای جلوگیری از نشت DNS، هنگام فعال‌بودن TPROXY، DNSهای DHCP شبکهٔ انتخابی موقتا با DNS عمومی گوگل جایگزین می‌شوند و با خاموش‌کردن به مقدار قبلی برمی‌گردند.')),
+			E('div', { 'class': 'gvpn-note', 'style': 'display:none' }, _('حالت Full فقط با CodeFull.gs و tunnel-node فعال روی VPS یا Cloud Run کار می‌کند. بدون سرور تونل، هدایت خودکار LAN را فعال نکنید.')),
 			E('div', { 'class': 'gvpn-button-row' }, [
 				E('button', { 'class': 'cbi-button gvpn-button-start', 'click': ui.createHandlerFn(this, function() {
 					return service('start', _('سرویس شروع شد.'));
@@ -213,6 +213,15 @@ return view.extend({
 		poll.add(refresh, 5);
 
 		return m.render().then(function(formNode) {
+			var modeInput = formNode.querySelector('select[id$=".mode"]');
+			var fullNote = panel.querySelector('.gvpn-note');
+			function updateFullNote() {
+				fullNote.style.display = modeInput && modeInput.value === 'full' ? '' : 'none';
+			}
+			if (modeInput) {
+				modeInput.addEventListener('change', updateFullNote);
+				updateFullNote();
+			}
 			var scriptInput = formNode.querySelector('input[id$=".script_ids"]');
 			if (scriptInput) {
 				scriptInput.addEventListener('input', function() {

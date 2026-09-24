@@ -1,5 +1,5 @@
 config gvpn 'main'
-	option mode 'full'
+	option mode 'apps_script'
 	option script_id ''
 	option auth_key ''
 	option listen_host '0.0.0.0'
